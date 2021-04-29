@@ -129,7 +129,7 @@ struct FunctionType
 };
 
 TAGGED_UNION(TypeData, Diverge,
-    (Infer, struct {
+    (Infer, struct X1{
         unsigned int index;
         InferClass  ty_class;
 
@@ -149,7 +149,7 @@ TAGGED_UNION(TypeData, Diverge,
         }),
     (Diverge, struct {}),
     (Primitive, ::HIR::CoreType),
-    (Path, struct {  // TODO: Pointer wrap
+    (Path, struct X2{  // TODO: Pointer wrap
         ::HIR::Path path;
         TypePathBinding binding;
 

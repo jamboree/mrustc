@@ -695,13 +695,14 @@ public:
     NT(ExprNode_UniOp);
     #undef NT
 };
+
 class NodeVisitorDef:
     public NodeVisitor
 {
 public:
     inline void visit(const unique_ptr<ExprNode>& cnode) {
         if(cnode.get()) {
-            TRACE_FUNCTION_F(typeid(*cnode).name());
+            TRACE_FUNCTION_F(typeid_name(*cnode));
             cnode->visit(*this);
         }
     }

@@ -23,7 +23,7 @@ struct LowerHIR_ExprNode_Visitor:
     ::std::unique_ptr< ::HIR::ExprNode> lower(const std::unique_ptr<::AST::ExprNode>& ep) {
         assert(ep);
         ep->visit(*this);
-        ASSERT_BUG(ep->span(), m_rv, typeid(*ep).name() << " - Yielded a nullptr HIR node");
+        ASSERT_BUG(ep->span(), m_rv, typeid_name(*ep) << " - Yielded a nullptr HIR node");
         return std::move(m_rv);
     }
     ::std::unique_ptr< ::HIR::ExprNode> lower_opt(const std::unique_ptr<::AST::ExprNode>& ep) {
@@ -786,7 +786,7 @@ struct LowerHIR_ExprNode_Visitor:
     const_cast<::AST::ExprNode*>(&e)->visit( v );
 
     if( ! v.m_rv ) {
-        BUG(e.span(), typeid(e).name() << " - Yielded a nullptr HIR node");
+        BUG(e.span(), typeid_name(e) << " - Yielded a nullptr HIR node");
     }
 
     return ::HIR::ExprPtr( mv$( v.m_rv ) );

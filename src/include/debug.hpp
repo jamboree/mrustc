@@ -38,6 +38,9 @@ extern int g_debug_indent_level;
 extern bool debug_enabled();
 extern ::std::ostream& debug_output(int indent, const char* function);
 
+template<class T>
+inline const char* typeid_name(const T & t) { return typeid(t).name(); }
+
 struct RepeatLitStr
 {
     const char *s;

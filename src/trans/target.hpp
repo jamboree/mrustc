@@ -93,7 +93,7 @@ struct TypeRepr
     (None, struct {
         }),
     // Variants numbered 0 to N (potentially offset)
-    (Linear, struct {
+    (Linear, struct X1{
         // Note: If `field.sub_fields` has entries, then this is a niche optimisation.
         // Path of the variant
         FieldPath   field;
@@ -113,7 +113,7 @@ struct TypeRepr
         }),
     // Tag is a fixed set of values in a field.
     // TODO: Encode niche in here too?
-    (Values, struct {
+    (Values, struct X2{
         // NOTE: `field.sub_path` should always be empty?
         FieldPath   field;
         ::std::vector<uint64_t> values;

@@ -1195,7 +1195,7 @@ namespace {
         }
     private:
         void no_revisit(::HIR::ExprNode& node) {
-            BUG(node.span(), "Node revisit unexpected - " << typeid(node).name());
+            BUG(node.span(), "Node revisit unexpected - " << typeid_name(node));
         }
     };  // class ExprVisitor_Revisit
 

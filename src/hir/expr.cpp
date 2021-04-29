@@ -21,7 +21,7 @@ void ::HIR::ExprVisitor::visit_node(::HIR::ExprNode& node) {
 }
 void ::HIR::ExprVisitorDef::visit_node_ptr(::std::unique_ptr< ::HIR::ExprNode>& node_ptr) {
     assert(node_ptr);
-    TRACE_FUNCTION_F(&*node_ptr << " " << typeid(*node_ptr).name());
+    TRACE_FUNCTION_F(&*node_ptr << " " << typeid_name(*node_ptr));
     node_ptr->visit(*this);
     visit_type(node_ptr->m_res_type);
 }

@@ -77,6 +77,8 @@ namespace {
                 std::map<unsigned, MirBuilder::SavedActiveLocal>  saved;
 
                 State(MIR::BasicBlockId entry): entrypoint(entry) {}
+
+                State(State&&) = default;
             };
             // Basic block to be terminated with the state switch
             MIR::BasicBlockId   bb_open;

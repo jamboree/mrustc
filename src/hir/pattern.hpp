@@ -128,7 +128,7 @@ struct Pattern
             unsigned int total_size;
             } ),
         // - Struct-like enum/struct value
-        (PathNamed, struct {
+        (PathNamed, struct X1{
             ::HIR::Path path;
             PathBinding binding;
 
