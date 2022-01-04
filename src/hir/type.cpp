@@ -58,11 +58,7 @@ namespace HIR {
     {
         TU_MATCH_HDRA( (x), { )
         TU_ARMA(Unevaluated, se) {
-            os << "/*expr:*/";
-            HIR_DumpExpr(os, *se);
-            }
-        TU_ARMA(Generic, se) {
-            os << se.name << "/*" << se.binding << "*/";
+            os << se;
             }
         TU_ARMA(Known, se)
             os << se;
@@ -95,41 +91,8 @@ Ordering HIR::ArraySize::ord(const HIR::ArraySize& x) const
     if(this->tag() != x.tag())
         return ::ord( static_cast<unsigned>(this->tag()), static_cast<unsigned>(x.tag()) );
     TU_MATCH_HDRA( (*this, x), {)
-    TU_ARMA(Unevaluated, tse, xse) {
-        // If the two types are the exact same expression (i.e. same pointer)
-        // - They're equal
-        if( tse == xse )
-            return OrdEqual;
-
-        // If only one has populated MIR, they can't be equal (sort populated MIR after)
-        if( !tse->m_mir != !xse->m_mir ) {
-            return (tse->m_mir ? OrdGreater : OrdLess);
-        }
-
-        // HACK: If the inner is a const param on both, sort based on that.
-        // - Very similar to the ordering of TypeRef::Generic
-        const auto* tn = dynamic_cast<const HIR::ExprNode_ConstParam*>(&**tse);
-        const auto* xn = dynamic_cast<const HIR::ExprNode_ConstParam*>(&**xse);
-        if( tn && xn )
-        {
-            // Is this valid? What if they're from different scopes?
-            return ::ord(tn->m_binding, xn->m_binding);
-        }
-
-        if( tse->m_mir )
-        {
-            assert(xse->m_mir);
-            // TODO: Compare MIR
-            TODO(Span(), "Compare non-expanded array sizes - (w/ MIR) " << *this << " and " << x);
-        }
-        else
-        {
-            TODO(Span(), "Compare non-expanded array sizes - (wo/ MIR) " << *this << " and " << x);
-        }
-        }
-    TU_ARMA(Generic, tse, xse) {
-        return ::ord(tse.binding, xse.binding);
-        }
+    TU_ARMA(Unevaluated, tse, xse)
+        return ::ord(tse, xse);
     TU_ARMA(Known, tse, xse)
         return ::ord(tse, xse);
     }
@@ -140,9 +103,7 @@ HIR::ArraySize HIR::ArraySize::clone() const
 {
     TU_MATCH_HDRA( (*this), {)
     TU_ARMA(Unevaluated, se)
-        return se;
-    TU_ARMA(Generic, se)
-        return se;
+        return se.clone();
     TU_ARMA(Known, se)
         return se;
     }
@@ -155,6 +116,23 @@ void ::HIR::TypeRef::fmt(::std::ostream& os) const
         os << "NULL";
         return ;
     }
+
+    thread_local static std::vector<const HIR::TypeInner*>  s_recurse_stack;
+    for(const auto* p : s_recurse_stack) {
+        if( p == m_ptr ) {
+            os << "RECURSE";
+            return ;
+        }
+    }
+    struct _ {
+        _(const HIR::TypeInner* ptr) {
+            s_recurse_stack.push_back(ptr);
+        }
+        ~_() {
+            s_recurse_stack.pop_back();
+        }
+    } h(m_ptr);
+
     //os << "{" << m_ptr << "}";
     TU_MATCH_HDRA( (data()), { )
     TU_ARMA(Infer, e) {
@@ -165,7 +143,6 @@ void ::HIR::TypeRef::fmt(::std::ostream& os) const
             switch(e.ty_class)
             {
             case ::HIR::InferClass::None:   break;
-            case ::HIR::InferClass::Diverge:os << ":!"; break;
             case ::HIR::InferClass::Float:  os << ":f"; break;
             case ::HIR::InferClass::Integer:os << ":i"; break;
             }
@@ -369,6 +346,9 @@ Ordering HIR::TypeRef::ord(const ::HIR::TypeRef& x) const
 {
     Ordering    rv;
 
+    if( &data() == &x.data() )
+        return OrdEqual;
+
     ORD( static_cast<unsigned int>(data().tag()), static_cast<unsigned int>(x.data().tag()) );
 
     TU_MATCH(::HIR::TypeData, (data(), x.data()), (te, xe),
@@ -519,6 +499,50 @@ namespace {
     {
         return t.match_test_generics_fuzz(sp, x, resolve_placeholder, callback);
     }
+    ::HIR::Compare match_values(const Span& sp, const ::HIR::ConstGeneric& t, const ::HIR::ConstGeneric& x, ::HIR::MatchGenerics& callback)
+    {
+        // LHS generic: call callback
+        if( const auto* e = t.opt_Generic() ) {
+            return callback.match_val(*e, x);
+        }
+
+        // Either are infer, check for exact match or return fuzzy
+        if(const auto* xep = x.opt_Infer())
+        {
+            const auto& xe = *xep;
+
+            if( xe.index != ~0u && t.is_Infer() && t.as_Infer().index == xe.index )
+            {
+                return ::HIR::Compare::Equal;
+            }
+
+            return ::HIR::Compare::Fuzzy;
+        }
+        if(const auto* tep = t.opt_Infer())
+        {
+            const auto& te = *tep;
+            ASSERT_BUG(sp, te.index != ~0u, "Encountered ivar for `this` - " << t);
+            return ::HIR::Compare::Fuzzy;
+        }
+
+        if( t.tag() != x.tag() )
+        {
+            return ::HIR::Compare::Unequal;
+        }
+
+        TU_MATCH_HDRA( (t,x), { )
+        TU_ARMA(Infer, te,xe) throw "Unreachable";
+        TU_ARMA(Unevaluated, te,xe) {
+            if(te == xe) {
+                return ::HIR::Compare::Equal;
+            }
+            }
+        TU_ARMA(Generic, te,xe) throw "Unreachable";
+        TU_ARMA(Evaluated, te, xe)
+            return *te == *xe ? ::HIR::Compare::Equal : ::HIR::Compare::Unequal;
+        }
+	throw "Unreachable";
+    }
 }
 
 bool ::HIR::TypeRef::match_test_generics(const Span& sp, const ::HIR::TypeRef& x_in, t_cb_resolve_type resolve_placeholder, ::HIR::MatchGenerics& callback) const
@@ -546,7 +570,6 @@ bool ::HIR::TypeRef::match_test_generics(const Span& sp, const ::HIR::TypeRef& x
         switch(xe.ty_class)
         {
         case ::HIR::InferClass::None:
-        case ::HIR::InferClass::Diverge:
             // TODO: Have another callback (optional?) that allows the caller to equate `v` somehow
             // - Very niche?
             return Compare::Fuzzy;
@@ -596,7 +619,6 @@ bool ::HIR::TypeRef::match_test_generics(const Span& sp, const ::HIR::TypeRef& x
         switch(te.ty_class)
         {
         case ::HIR::InferClass::None:
-        case ::HIR::InferClass::Diverge:
             // TODO: Have another callback (optional?) that allows the caller to equate `v` somehow
             // - Very niche?
             return Compare::Fuzzy;
@@ -634,6 +656,30 @@ bool ::HIR::TypeRef::match_test_generics(const Span& sp, const ::HIR::TypeRef& x
             break;
         }
     }
+#if 1
+    thread_local static std::vector<const HIR::TypeInner*>  s_recurse_stack;
+    for(const auto* p : s_recurse_stack) {
+        if( p == m_ptr ) {
+            DEBUG("Recursion");
+            ASSERT_BUG(sp, &v == &x, "Recursion with unequal type pointers");
+            return HIR::Compare::Equal;
+        }
+    }
+    struct _ {
+        _(const HIR::TypeInner* ptr) {
+            s_recurse_stack.push_back(ptr);
+        }
+        ~_() {
+            s_recurse_stack.pop_back();
+        }
+    } h(m_ptr);
+#else
+    // NOTE: This doesn't allow matching identical types (which can be desirable)
+    if( &v == &x ) {
+        DEBUG("Pointer equality");
+        return HIR::Compare::Equal;
+    }
+#endif
 
     if( v.data().tag() != x.data().tag() ) {
         // HACK: If the path is Opaque, return a fuzzy match.
@@ -665,13 +711,11 @@ bool ::HIR::TypeRef::match_test_generics(const Span& sp, const ::HIR::TypeRef& x
         switch(te.ty_class)
         {
         case ::HIR::InferClass::None:
-        case ::HIR::InferClass::Diverge:
             return Compare::Fuzzy;
         default:
             switch(xe.ty_class)
             {
             case ::HIR::InferClass::None:
-            case ::HIR::InferClass::Diverge:
                 return Compare::Fuzzy;
             default:
                 if( te.ty_class != xe.ty_class )
@@ -774,12 +818,15 @@ bool ::HIR::TypeRef::match_test_generics(const Span& sp, const ::HIR::TypeRef& x
         }
     TU_ARMA(Array, te, xe) {
         auto rv = Compare::Equal;
-        if( const auto* tse = te.size.opt_Generic() )
+        if( const auto* tse = te.size.opt_Unevaluated() )
         {
-            auto v = xe.size.opt_Known() ? HIR::Literal(xe.size.as_Known())
-                : HIR::Literal(xe.size.as_Generic())
-                ;
-            rv &= callback.match_val(*tse, v);
+            HIR::ConstGeneric   v;
+            if( xe.size.opt_Known() ) {
+                rv &= match_values(sp, *tse, EncodedLiteralPtr( EncodedLiteral::make_usize(xe.size.as_Known()) ), callback);
+            }
+            else {
+                rv &= match_values(sp, *tse, xe.size.as_Unevaluated(), callback );
+            }
         }
         else if( te.size != xe.size ) {
             return Compare::Unequal;
@@ -922,6 +969,7 @@ const ::HIR::TraitMarkings* HIR::TypePathBinding::get_trait_markings() const
             traits.push_back( trait.clone() );
         return ::HIR::TypeRef( TypeData::make_ErasedType({
             e.m_origin.clone(), e.m_index,
+            e.m_is_sized,
             mv$(traits),
             e.m_lifetime
             }) );
@@ -1005,7 +1053,6 @@ const ::HIR::TraitMarkings* HIR::TypePathBinding::get_trait_markings() const
         switch(e->ty_class)
         {
         case ::HIR::InferClass::None:
-        case ::HIR::InferClass::Diverge:
             return Compare::Fuzzy;
         case ::HIR::InferClass::Integer:
             TU_MATCH_HDRA( (right.data()), {)
@@ -1029,7 +1076,6 @@ const ::HIR::TraitMarkings* HIR::TypePathBinding::get_trait_markings() const
                 switch(re.ty_class)
                 {
                 case ::HIR::InferClass::None:
-                case ::HIR::InferClass::Diverge:
                 case ::HIR::InferClass::Integer:
                     return Compare::Fuzzy;
                 case ::HIR::InferClass::Float:
@@ -1058,7 +1104,6 @@ const ::HIR::TraitMarkings* HIR::TypePathBinding::get_trait_markings() const
                 switch(re.ty_class)
                 {
                 case ::HIR::InferClass::None:
-                case ::HIR::InferClass::Diverge:
                 case ::HIR::InferClass::Float:
                     return Compare::Fuzzy;
                 case ::HIR::InferClass::Integer:
@@ -1079,7 +1124,6 @@ const ::HIR::TraitMarkings* HIR::TypePathBinding::get_trait_markings() const
         switch( re->ty_class )
         {
         case ::HIR::InferClass::None:
-        case ::HIR::InferClass::Diverge:
             return Compare::Fuzzy;
         case ::HIR::InferClass::Integer:
             TU_MATCH_HDRA( (left.data()), {)
@@ -1227,6 +1271,8 @@ const ::HIR::TraitMarkings* HIR::TypePathBinding::get_trait_markings() const
         return rv;
         }
     TU_ARMA(Closure, le, re) {
+        if( le.node != re.node )
+            return Compare::Unequal;
         if( le.m_arg_types.size() != re.m_arg_types.size() )
             return Compare::Unequal;
         auto rv = Compare::Equal;

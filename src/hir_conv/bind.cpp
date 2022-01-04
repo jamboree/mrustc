@@ -74,26 +74,14 @@ namespace {
         if( params.m_types.size() != params_def.m_types.size() ) {
             ERROR(sp, E0000, "Incorrect parameter count, expected " << params_def.m_types.size() << ", got " << params.m_types.size());
         }
+        if( params.m_values.size() == 0 ) {
+            params.m_values.resize( params_def.m_values.size() );
+        }
+        if( params.m_values.size() != params_def.m_values.size() ) {
+            ERROR(sp, E0000, "Incorrect value parameter count, expected " << params_def.m_values.size() << ", got " << params.m_values.size());
+        }
         #endif
     }
-
-    const ::HIR::Struct& get_struct_ptr(const Span& sp, const ::HIR::Crate& crate, ::HIR::GenericPath& path) {
-        const auto& str = *reinterpret_cast< const ::HIR::Struct*>( get_type_pointer(sp, crate, path.m_path, Target::Struct) );
-        fix_type_params(sp, str.m_params,  path.m_params);
-        return str;
-    }
-    ::std::pair< const ::HIR::Enum*, unsigned int> get_enum_ptr(const Span& sp, const ::HIR::Crate& crate, ::HIR::GenericPath& path) {
-        const auto& enm = *reinterpret_cast< const ::HIR::Enum*>( get_type_pointer(sp, crate, path.m_path, Target::EnumVariant) );
-        const auto& des_name = path.m_path.m_components.back();
-        auto idx = enm.find_variant(des_name);
-        if( idx == SIZE_MAX ) {
-            ERROR(sp, E0000, "Couldn't find enum variant " << path);
-        }
-
-        fix_type_params(sp, enm.m_params,  path.m_params);
-        return ::std::make_pair( &enm, static_cast<unsigned>(idx) );
-    }
-
 
     class Visitor:
         public ::HIR::Visitor
@@ -148,38 +136,6 @@ namespace {
                 if(r.p)
                     visit_path(*r.p, ::HIR::Visitor::PathContext::VALUE);
             }
-        }
-        void visit_literal(const Span& sp, ::HIR::Literal& lit)
-        {
-            TU_MATCH(::HIR::Literal, (lit), (e),
-            (Invalid,
-                ),
-            (Defer,
-                // Shouldn't happen here, but ...
-                ),
-            (Generic,
-                ),
-            (List,
-                for(auto& val : e) {
-                    visit_literal(sp, val);
-                }
-                ),
-            (Variant,
-                visit_literal(sp, *e.val);
-                ),
-            (Integer,
-                ),
-            (Float,
-                ),
-            (BorrowPath,
-                visit_path(e, ::HIR::Visitor::PathContext::VALUE);
-                ),
-            (BorrowData,
-                visit_literal(sp, *e.val);
-                ),
-            (String,
-                )
-            )
         }
 
         void visit_pattern_Value(const Span& sp, ::HIR::Pattern& pat, ::HIR::Pattern::Value& val)
@@ -279,180 +235,72 @@ namespace {
                 this->visit_pattern_Value(sp, pat, e.val);
                 }
             TU_ARMA(Range, e) {
-                this->visit_pattern_Value(sp, pat, e.start);
-                this->visit_pattern_Value(sp, pat, e.end);
+                if(e.start) this->visit_pattern_Value(sp, pat, *e.start);
+                if(e.end  ) this->visit_pattern_Value(sp, pat, *e.end);
                 }
             TU_ARMA(PathValue, e) {
-#if 0
-                const auto& str = get_struct_ptr(sp, m_crate, e.path);
-                TU_IFLET(::HIR::Struct::Data, str.m_data, Unit, _,
-                    e.binding = &str;
-                )
-                else {
-                    ERROR(sp, E0000, "Struct value pattern on non-unit struct " << e.path);
-                }
-#endif
                 }
             TU_ARMA(PathTuple, e) {
-#if 0
-                const auto& str = get_struct_ptr(sp, m_crate, e.path);
-                TU_IFLET(::HIR::Struct::Data, str.m_data, Tuple, _,
-                    e.binding = &str;
-                )
-                else {
-                    ERROR(sp, E0000, "Struct tuple pattern on non-tuple struct " << e.path);
-                }
-#endif
                 }
             TU_ARMA(PathNamed, e) {
-#if 0
-                const auto& str = get_struct_ptr(sp, m_crate, e.path);
-                if(str.m_data.is_Named() ) {
                 }
-                else if( str.m_data.is_Unit() && e.sub_patterns.size() == 0 ) {
-                }
-                else if( str.m_data.is_Tuple() && str.m_data.as_Tuple().empty() && e.sub_patterns.size() == 0 ) {
-                }
-                else {
-                    ERROR(sp, E0000, "Struct pattern `" << pat << "` on field-less struct " << e.path);
-                }
-                e.binding = &str;
-#endif
-                }
-#if 0
-            TU_ARMA(EnumValue, e) {
-                auto p = get_enum_ptr(sp, m_crate, e.path);
-                if( p.first->m_data.is_Data() )
-                {
-                    const auto& var = p.first->m_data.as_Data()[p.second];
-                    if( var.is_struct || var.type != ::HIR::TypeRef::new_unit() )
-                        ERROR(sp, E0000, "Enum value pattern on non-unit variant " << e.path);
-                }
-                e.binding_ptr = p.first;
-                e.binding_idx = p.second;
-                }
-            TU_ARMA(EnumTuple, e) {
-                auto p = get_enum_ptr(sp, m_crate, e.path);
-                if( !p.first->m_data.is_Data() )
-                    ERROR(sp, E0000, "Enum tuple pattern on non-tuple variant " << e.path);
-                const auto& var = p.first->m_data.as_Data()[p.second];
-                if( var.is_struct )
-                    ERROR(sp, E0000, "Enum tuple pattern on non-tuple variant " << e.path);
-                e.binding_ptr = p.first;
-                e.binding_idx = p.second;
-                }
-            TU_ARMA(EnumStruct, e) {
-                auto p = get_enum_ptr(sp, m_crate, e.path);
-                if( !e.is_exhaustive && e.sub_patterns.empty() )
-                {
-                    if( !p.first->m_data.is_Data() ) {
-                        pat.m_data = ::HIR::Pattern::Data::make_EnumValue({
-                                ::std::move(e.path), p.first, p.second
-                                });
-                    }
-                    else {
-                        const auto& var = p.first->m_data.as_Data()[p.second];
-                        if( var.type == ::HIR::TypeRef::new_unit() )
-                        {
-                            pat.m_data = ::HIR::Pattern::Data::make_EnumValue({
-                                    ::std::move(e.path), p.first, p.second
-                                    });
-                        }
-                        else if( !var.is_struct )
-                        {
-                            ASSERT_BUG(sp, var.type.data().is_Path(), "");
-                            const auto& te = var.type.data().as_Path();
-                            const ::HIR::Struct* strp;
-                            if( te.binding.is_Unbound() ) {
-                                strp = &m_crate.get_struct_by_path(sp, te.path.m_data.as_Generic().m_path);
-                            }
-                            else {
-                                ASSERT_BUG(sp, te.binding.is_Struct(), "EnumStruct pattern on unexpected variant " << e.path << " with " << te.binding.tag_str());
-                                strp = te.binding.as_Struct();
-                            }
-                            const auto& str = *strp;
-                            ASSERT_BUG(sp, str.m_data.is_Tuple(), "");
-                            const auto& flds = str.m_data.as_Tuple();
-                            ::std::vector<HIR::Pattern> subpats;
-                            for(size_t i = 0; i < flds.size(); i ++)
-                                subpats.push_back(::HIR::Pattern { });
-                            pat.m_data = ::HIR::Pattern::Data::make_EnumTuple({
-                                    ::std::move(e.path), p.first, p.second, mv$(subpats)
-                                    });
-                        }
-                        else
-                        {
-                            // Keep as a struct pattern
-                        }
-                    }
-                }
-                else
-                {
-                    if( !p.first->m_data.is_Data() )
-                    {
-                        ERROR(sp, E0000, "Enum struct pattern `" << pat << "` on non-struct variant " << e.path);
-                    }
-                    else
-                    {
-                        const auto& var = p.first->m_data.as_Data()[p.second];
-                        if( !var.is_struct )
-                            ERROR(sp, E0000, "Enum struct pattern `" << pat << "` on non-struct variant " << e.path);
-                    }
-                }
-                e.binding_ptr = p.first;
-                e.binding_idx = p.second;
-                }
-#endif
             }
         }
         static void fix_param_count(const Span& sp, const ::HIR::GenericPath& path, const ::HIR::GenericParams& param_defs, ::HIR::PathParams& params, bool fill_infer=true, const ::HIR::TypeRef* self_ty=nullptr)
         {
-            if( params.m_types.size() == param_defs.m_types.size() ) {
-                // Nothing to do, all good
-                return ;
-            }
+            if( params.m_types.size() != param_defs.m_types.size() )
+            {
+                TRACE_FUNCTION_FR(path, params);
 
-            TRACE_FUNCTION_F(path);
-
-            if( params.m_types.size() == 0 && fill_infer ) {
-                for(const auto& typ : param_defs.m_types) {
-                    (void)typ;
-                    params.m_types.push_back( ::HIR::TypeRef() );
+                if( params.m_types.size() == 0 && fill_infer ) {
+                    for(const auto& typ : param_defs.m_types) {
+                        (void)typ;
+                        params.m_types.push_back( ::HIR::TypeRef() );
+                    }
+                }
+                else if( params.m_types.size() > param_defs.m_types.size() ) {
+                    ERROR(sp, E0000, "Too many type parameters passed to " << path);
+                }
+                else {
+                    while( params.m_types.size() < param_defs.m_types.size() ) {
+                        const auto& typ = param_defs.m_types[params.m_types.size()];
+                        if( typ.m_default.data().is_Infer() ) {
+                            ERROR(sp, E0000, "Omitted type parameter with no default in " << path);
+                        }
+                        else {
+                            // Clone, replacing `self` if a replacement was provided.
+                            auto ty = clone_ty_with(sp, typ.m_default, [&](const auto& ty, auto& out){
+                                if(const auto* te = ty.data().opt_Generic() )
+                                {
+                                    if( te->binding == GENERIC_Self ) {
+                                        if( !self_ty )
+                                            TODO(sp, "Self enountered in default params, but no Self available - " << ty << " in " << typ.m_default << " for " << path);
+                                        out = self_ty->clone();
+                                    }
+                                    // NOTE: Should only be seeing impl-level params here. Method-level ones are only seen in expression context.
+                                    else if( (te->binding >> 8) == 0 ) {
+                                        auto idx = te->binding & 0xFF;
+                                        ASSERT_BUG(sp, idx < params.m_types.size(), "TODO: Handle use of latter types in defaults");
+                                        out = params.m_types[idx].clone();
+                                    }
+                                    else {
+                                        TODO(sp, "Monomorphise in fix_param_count - encountered " << ty << " in " << typ.m_default);
+                                    }
+                                    return true;
+                                }
+                                return false;
+                                });
+                            params.m_types.push_back( mv$(ty) );
+                        }
+                    }
                 }
             }
-            else if( params.m_types.size() > param_defs.m_types.size() ) {
-                ERROR(sp, E0000, "Too many type parameters passed to " << path);
-            }
-            else {
-                while( params.m_types.size() < param_defs.m_types.size() ) {
-                    const auto& typ = param_defs.m_types[params.m_types.size()];
-                    if( typ.m_default.data().is_Infer() ) {
-                        ERROR(sp, E0000, "Omitted type parameter with no default in " << path);
-                    }
-                    else {
-                        // Clone, replacing `self` if a replacement was provided.
-                        auto ty = clone_ty_with(sp, typ.m_default, [&](const auto& ty, auto& out){
-                            if(const auto* te = ty.data().opt_Generic() )
-                            {
-                                if( te->binding == GENERIC_Self ) {
-                                    if( !self_ty )
-                                        TODO(sp, "Self enountered in default params, but no Self available - " << ty << " in " << typ.m_default << " for " << path);
-                                    out = self_ty->clone();
-                                }
-                                // NOTE: Should only be seeing impl-level params here. Method-level ones are only seen in expression context.
-                                else if( (te->binding >> 8) == 0 ) {
-                                    auto idx = te->binding & 0xFF;
-                                    ASSERT_BUG(sp, idx < params.m_types.size(), "TODO: Handle use of latter types in defaults");
-                                    out = params.m_types[idx].clone();
-                                }
-                                else {
-                                    TODO(sp, "Monomorphise in fix_param_count - encountered " << ty << " in " << typ.m_default);
-                                }
-                                return true;
-                            }
-                            return false;
-                            });
-                        params.m_types.push_back( mv$(ty) );
+            if( params.m_values.size() != param_defs.m_values.size() )
+            {
+                if( params.m_values.size() == 0 && fill_infer ) {
+                    for(const auto& typ : param_defs.m_values) {
+                        (void)typ;
+                        params.m_values.push_back( ::HIR::ConstGeneric::make_Infer({}) );
                     }
                 }
             }
@@ -464,8 +312,20 @@ namespace {
             {
                 if(auto* be = bound.opt_TraitBound())
                 {
-                    const auto& trait = m_crate.get_trait_by_path(sp, be->trait.m_path.m_path);
-                    fix_param_count(sp, be->trait.m_path, trait.m_params, be->trait.m_path.m_params, /*fill_infer=*/false, &be->type);
+                    {
+                        const auto& trait = m_crate.get_trait_by_path(sp, be->trait.m_path.m_path);
+                        fix_param_count(sp, be->trait.m_path, trait.m_params, be->trait.m_path.m_params, /*fill_infer=*/false, &be->type);
+                    }
+                    // Also ensure that the defaults are filled in the source traits
+                    // - Is there a better solution to this? It feels like it would give the wrong answer (filling defaults incorrectly)
+                    for(auto& aty : be->trait.m_type_bounds) {
+                        const auto& trait = m_crate.get_trait_by_path(sp, aty.second.source_trait.m_path);
+                        fix_param_count(sp, be->trait.m_path, trait.m_params, aty.second.source_trait.m_params, /*fill_infer=*/false, &be->type);
+                    }
+                    for(auto& aty : be->trait.m_type_bounds) {
+                        const auto& trait = m_crate.get_trait_by_path(sp, aty.second.source_trait.m_path);
+                        fix_param_count(sp, be->trait.m_path, trait.m_params, aty.second.source_trait.m_params, /*fill_infer=*/false, &be->type);
+                    }
                 }
             }
 
@@ -611,20 +471,19 @@ namespace {
             ::HIR::Visitor::visit_trait(p, item);
         }
 
-        // TODO: Are generics for types "item" or "impl"?
         void visit_enum(::HIR::ItemPath p, ::HIR::Enum& item) override
         {
-            auto _ = this->m_ms.set_item_generics(item.m_params);
+            auto _ = this->m_ms.set_impl_generics(item.m_params);
             ::HIR::Visitor::visit_enum(p, item);
         }
         void visit_struct(::HIR::ItemPath p, ::HIR::Struct& item) override
         {
-            auto _ = this->m_ms.set_item_generics(item.m_params);
+            auto _ = this->m_ms.set_impl_generics(item.m_params);
             ::HIR::Visitor::visit_struct(p, item);
         }
         void visit_union(::HIR::ItemPath p, ::HIR::Union& item) override
         {
-            auto _ = this->m_ms.set_item_generics(item.m_params);
+            auto _ = this->m_ms.set_impl_generics(item.m_params);
             ::HIR::Visitor::visit_union(p, item);
         }
 
@@ -696,6 +555,39 @@ namespace {
                 {
                     upper_visitor.visit_path(node.m_path, ::HIR::Visitor::PathContext::VALUE);
                     ::HIR::ExprVisitorDef::visit(node);
+
+                    // #[rustc_legacy_const_generics] - A backwards compatability hack added between 1.39 and 1.54 to be backwards compatible with the x86 intrinsics
+                    // - Rewrites some literal arguments into const generics
+                    if(auto* e = node.m_path.m_data.opt_Generic())
+                    {
+                        auto& fcn = upper_visitor.m_crate.get_function_by_path(node.span(), e->m_path);
+                        if(!fcn.m_markings.rustc_legacy_const_generics.empty() )
+                        {
+                            if( node.m_args.size() == fcn.m_args.size() ) {
+                                // Acceptable
+                            }
+                            else if( node.m_args.size() == fcn.m_args.size() + fcn.m_markings.rustc_legacy_const_generics.size() ) {
+                                for(auto idx : fcn.m_markings.rustc_legacy_const_generics)
+                                {
+                                    auto& arg_node = node.m_args.at(idx);
+                                    assert(arg_node);
+                                    // TODO: Check that the expression is a valid const (no locals referenced, no function calls?)
+                                    // - Allow: Arithmatic, casts, literals
+                                    //if( !dynamic_cast<const HIR::ExprNode_Literal*>(arg_node.get()) )
+                                    //    ERROR(arg_node->span(), E0000, "Argument " << idx << " must be a literal for #[rustc_legacy_const_generics] tagged function");
+                                    HIR::ExprPtr    ep { std::move(arg_node) };
+                                    e->m_params.m_values.push_back( HIR::ConstGeneric( std::make_shared<HIR::ExprPtr>(std::move(ep)) ));
+                                    // - Visit to ensure that the expr state gets filled
+                                    upper_visitor.visit_constgeneric(e->m_params.m_values.back());
+                                }
+                                auto new_end = std::remove_if(node.m_args.begin(), node.m_args.end(), [](const HIR::ExprNodeP& np){ return !np; });
+                                node.m_args.erase(new_end, node.m_args.end());
+                            }
+                            else {
+                                // Will error downstream
+                            }
+                        }
+                    }
                 }
                 void visit(::HIR::ExprNode_CallMethod& node) override
                 {
@@ -711,7 +603,11 @@ namespace {
                 }
                 void visit(::HIR::ExprNode_ArraySized& node) override
                 {
-                    upper_visitor.visit_expr(node.m_size);
+                    auto& as = node.m_size;
+                    if( as.is_Unevaluated() && as.as_Unevaluated().is_Unevaluated() )
+                    {
+                        upper_visitor.visit_expr(*as.as_Unevaluated().as_Unevaluated());
+                    }
                     ::HIR::ExprVisitorDef::visit(node);
                 }
 
@@ -809,25 +705,28 @@ namespace {
             struct Enumerate
             {
                 ::std::vector< ::HIR::TraitPath>    supertraits;
+                ::std::vector<const ::HIR::TraitPath*>  tp_stack;
 
-                void enum_supertraits_in(const ::HIR::Trait& tr, ::HIR::GenericPath path, ::std::function<::HIR::TypeRef(const char*)> get_aty)
+                void enum_supertraits_in(const ::HIR::Trait& tr, ::HIR::TraitPath path)
                 {
                     TRACE_FUNCTION_F(path);
+                    tp_stack.push_back(&path);
+                    auto& params = path.m_path.m_params;
 
                     // Fill defaulted parameters.
                     // NOTE: Doesn't do much error checking.
-                    if( path.m_params.m_types.size() != tr.m_params.m_types.size() )
+                    if( path.m_path.m_params.m_types.size() != tr.m_params.m_types.size() )
                     {
-                        ASSERT_BUG(sp, path.m_params.m_types.size() < tr.m_params.m_types.size(), "");
-                        for(unsigned int i = path.m_params.m_types.size(); i < tr.m_params.m_types.size(); i ++)
+                        ASSERT_BUG(sp, params.m_types.size() < tr.m_params.m_types.size(), "");
+                        for(unsigned int i = params.m_types.size(); i < tr.m_params.m_types.size(); i ++)
                         {
                             const auto& def = tr.m_params.m_types[i];
-                            path.m_params.m_types.push_back( def.m_default.clone_shallow() );
+                            params.m_types.push_back( def.m_default.clone_shallow() );
                         }
                     }
 
                     ::HIR::TypeRef  ty_self { "Self", 0xFFFF };
-                    auto monomorph_cb = MonomorphStatePtr(&ty_self, &path.m_params, nullptr);
+                    auto monomorph_cb = MonomorphStatePtr(&ty_self, &params, nullptr);
                     if( tr.m_all_parent_traits.size() > 0 )
                     {
                         for(const auto& pt : tr.m_all_parent_traits)
@@ -840,13 +739,7 @@ namespace {
                         // Recurse into parent traits
                         for(const auto& pt : tr.m_parent_traits)
                         {
-                            auto get_aty_this = [&](const char* name) {
-                                auto it = pt.m_type_bounds.find(name);
-                                if( it != pt.m_type_bounds.end() )
-                                    return monomorph_cb.monomorph_type(sp, it->second.type);
-                                return get_aty(name);
-                            };
-                            enum_supertraits_in(*pt.m_trait_ptr, monomorph_cb.monomorph_genericpath(sp, pt.m_path, false), get_aty_this);
+                            enum_supertraits_in(*pt.m_trait_ptr, monomorph_cb.monomorph_traitpath(sp, pt, false));
                         }
                         // - Bound parent traits
                         for(const auto& b : tr.m_params.m_bounds)
@@ -857,36 +750,62 @@ namespace {
                             if( be.type != ::HIR::TypeRef("Self", 0xFFFF) )
                                 continue;
                             const auto& pt = be.trait;
-                            if( pt.m_path.m_path == path.m_path )
+                            if( pt.m_path.m_path == path.m_path.m_path )
                                 continue ;
 
-                            auto get_aty_this = [&](const char* name) {
-                                auto it = pt.m_type_bounds.find(name);
-                                if( it != pt.m_type_bounds.end() )
-                                    return monomorph_cb.monomorph_type(sp, it->second.type);
-                                return get_aty(name);
-                            };
-
-                            enum_supertraits_in(*pt.m_trait_ptr, monomorph_cb.monomorph_genericpath(sp, pt.m_path, false), get_aty_this);
+                            enum_supertraits_in(*pt.m_trait_ptr, monomorph_cb.monomorph_traitpath(sp, pt, false));
                         }
                     }
 
 
                     // Build output path.
                     ::HIR::TraitPath    out_path;
-                    out_path.m_path = mv$(path);
+                    out_path.m_path = mv$(path.m_path);
                     out_path.m_trait_ptr = &tr;
                     // - Locate associated types for this trait
                     for(const auto& ty : tr.m_types)
                     {
-                        auto v = get_aty(ty.first.c_str());
-                        if( v != ::HIR::TypeRef() )
                         {
-                            out_path.m_type_bounds.insert( ::std::make_pair(ty.first, ::HIR::TraitPath::AtyEqual { out_path.m_path.clone(), mv$(v) }) );
+                            HIR::TypeRef    v;
+
+                            for(auto oit = tp_stack.rbegin(); oit != tp_stack.rend(); ++oit)
+                            {
+                                auto it = (*oit)->m_type_bounds.find(ty.first);
+                                if( it != (*oit)->m_type_bounds.end() ) {
+                                    // TODO: Check the source trait
+                                    v = it->second.type.clone();
+                                    break;
+                                }
+                            }
+                            // TODO: What if there's multiple?
+
+                            if( v != ::HIR::TypeRef() )
+                            {
+                                out_path.m_type_bounds.insert( ::std::make_pair(ty.first, ::HIR::TraitPath::AtyEqual { out_path.m_path.clone(), mv$(v) }) );
+                            }
+                        }
+
+                        {
+                            std::vector<HIR::TraitPath> traits;
+                            for(auto oit = tp_stack.rbegin(); oit != tp_stack.rend(); ++oit)
+                            {
+                                auto it = (*oit)->m_trait_bounds.find(ty.first);
+                                if( it != (*oit)->m_trait_bounds.end() )
+                                {
+                                    // TODO: Check the source trait
+                                    for(const auto& t : it->second.traits)
+                                        traits.push_back(t.clone());
+                                }
+                            }
+                            if( !traits.empty() )
+                            {
+                                out_path.m_trait_bounds.insert( ::std::make_pair(ty.first, ::HIR::TraitPath::AtyBound { out_path.m_path.clone(), mv$(traits) }) );
+                            }
                         }
                     }
                     // TODO: HRLs?
                     supertraits.push_back( mv$(out_path) );
+                    tp_stack.pop_back();
                 }
             };
 
@@ -896,13 +815,7 @@ namespace {
             Enumerate   e;
             for(const auto& pt : tr.m_parent_traits)
             {
-                auto get_aty = [&](const char* name)->::HIR::TypeRef {
-                    auto it = pt.m_type_bounds.find(name);
-                    if( it != pt.m_type_bounds.end() )
-                        return it->second.type.clone();
-                    return ::HIR::TypeRef();
-                };
-                e.enum_supertraits_in(*pt.m_trait_ptr, pt.m_path.clone(), get_aty);
+                e.enum_supertraits_in(*pt.m_trait_ptr, pt.clone());
             }
             for(const auto& b : tr.m_params.m_bounds)
             {
@@ -920,13 +833,7 @@ namespace {
                     continue ;
                 }
 
-                auto get_aty = [&](const char* name)->::HIR::TypeRef {
-                    auto it = be.trait.m_type_bounds.find(name);
-                    if( it != be.trait.m_type_bounds.end() )
-                        return it->second.type.clone();
-                    return ::HIR::TypeRef();
-                };
-                e.enum_supertraits_in(*be.trait.m_trait_ptr, be.trait.m_path.clone(), get_aty);
+                e.enum_supertraits_in(*be.trait.m_trait_ptr, be.trait.clone());
             }
 
             ::std::sort(e.supertraits.begin(), e.supertraits.end());

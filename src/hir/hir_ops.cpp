@@ -19,6 +19,31 @@
 namespace {
     bool matches_genericpath(const ::HIR::GenericPath& left, const ::HIR::GenericPath& right, ::HIR::t_cb_resolve_type ty_res, bool expand_generic);
 
+    bool matches_constgeneric(const ::HIR::ConstGeneric& left, const ::HIR::ConstGeneric& right, ::HIR::t_cb_resolve_type ty_res, bool expand_generic)
+    {
+        assert( !left.is_Infer() );
+        if(right.is_Infer())
+        {
+            return true;
+        }
+        if(right.is_Generic())
+        {
+            return left.is_Generic();
+        }
+
+        if(left.is_Generic()) {
+            //DEBUG("> Generic left, success");
+            return true;
+        }
+
+        if( left.tag() != right.tag() ) {
+            //DEBUG("> Tag mismatch, failure");
+            return false;
+        }
+
+        return left == right;
+    }
+
     bool matches_type_int(const ::HIR::TypeRef& left,  const ::HIR::TypeRef& right_in, ::HIR::t_cb_resolve_type ty_res, bool expand_generic)
     {
         assert(! left.data().is_Infer() );
@@ -36,7 +61,6 @@ namespace {
             switch(re->ty_class)
             {
             case ::HIR::InferClass::None:
-            case ::HIR::InferClass::Diverge:
                 //return left.m_data.is_Generic();
                 return true;
             case ::HIR::InferClass::Integer:
@@ -126,8 +150,19 @@ namespace {
         TU_ARMA(Array, le, re) {
             if( ! matches_type_int(le.inner, re.inner, ty_res, expand_generic) )
                 return false;
-            if(le.size.is_Generic()) {
+            if(le.size.is_Unevaluated()) {
                 // If the left is a generic, allow it.
+                if( re.size.is_Unevaluated()) {
+                    if( !matches_constgeneric(le.size.as_Unevaluated(), re.size.as_Unevaluated(), ty_res, expand_generic) )
+                        return false;
+                }
+                else {
+                    if( le.size.as_Unevaluated().is_Generic() ) {
+                    }
+                    else {
+                        TODO(Span(), "Match an unevaluated array with an evaluated one - " << le.size << " " << re.size);
+                    }
+                }
             }
             else {
                 // TODO: Other unresolved sizes?
@@ -194,15 +229,26 @@ namespace {
         {
             // Count mismatch. Allow due to defaults.
             if( left.m_params.m_types.size() != right.m_params.m_types.size() ) {
-                return true;
-                //TODO(Span(), "Match generic paths " << left << " and " << right << " - count mismatch");
             }
-            for( unsigned int i = 0; i < right.m_params.m_types.size(); i ++ )
+            else {
+                for( unsigned int i = 0; i < right.m_params.m_types.size(); i ++ )
+                {
+                    if( ! matches_type_int(left.m_params.m_types[i], right.m_params.m_types[i], ty_res, expand_generic) )
+                        return false;
+                }
+            }
+        }
+
+        if( left.m_params.m_values.size() > 0 || right.m_params.m_values.size() > 0 )
+        {
+            auto num = std::min( left.m_params.m_values.size(), right.m_params.m_values.size() );
+            for(size_t i = 0; i < num; i ++)
             {
-                if( ! matches_type_int(left.m_params.m_types[i], right.m_params.m_types[i], ty_res, expand_generic) )
+                if( !matches_constgeneric(left.m_params.m_values[i], right.m_params.m_values[i], ty_res, expand_generic) )
                     return false;
             }
         }
+
         return true;
     }
 }
@@ -210,7 +256,7 @@ namespace {
 namespace {
     bool is_unbounded_infer(const ::HIR::TypeRef& type) {
         if( const auto* e = type.data().opt_Infer() ) {
-            return e->ty_class == ::HIR::InferClass::None || e->ty_class == ::HIR::InferClass::Diverge;
+            return e->ty_class == ::HIR::InferClass::None;
         }
         else {
             return false;
@@ -608,7 +654,7 @@ namespace {
                 return ::HIR::Compare::Equal;
             }
         }
-        ::HIR::Compare match_val(const ::HIR::GenericRef& g, const ::HIR::Literal& sz) override {
+        ::HIR::Compare match_val(const ::HIR::GenericRef& g, const ::HIR::ConstGeneric& sz) override {
             TODO(Span(), "Matcher::match_val " << g << " with " << sz);
         }
 
@@ -618,7 +664,7 @@ namespace {
             ASSERT_BUG(sp, impl_tys[g.idx()], "");
             return impl_tys[g.idx()]->clone();
         }
-        ::HIR::Literal get_value(const Span& sp, const ::HIR::GenericRef& g) const override {
+        ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& g) const override {
             TODO(Span(), "Matcher::get_value " << g);
         }
 
@@ -1089,6 +1135,7 @@ namespace
         TU_ARMA(Pointer, te)
             return get_type_crate(crate, te.inner);
         }
+        throw "Unreachable";
     }
 }
 
@@ -1406,7 +1453,28 @@ const ::HIR::t_struct_fields& HIR::pattern_get_named(const Span& sp, const ::HIR
     return pattern_get_struct(sp, path, binding, false).m_data.as_Named();
 }
 
+namespace HIR {
+EncodedLiteralPtr::EncodedLiteralPtr(EncodedLiteral el)
+{
+    p = new EncodedLiteral(mv$(el));
+}
+EncodedLiteralPtr::~EncodedLiteralPtr()
+{
+    if(p) {
+        delete p;
+        p = nullptr;
+    }
+}
+}
+
 // ---
+EncodedLiteral EncodedLiteral::make_usize(uint64_t v)
+{
+    EncodedLiteral  rv;
+    rv.bytes.resize(Target_GetPointerBits() / 8);
+    rv.write_usize(0, v);
+    return rv;
+}
 EncodedLiteral EncodedLiteral::clone() const
 {
     EncodedLiteral  rv;
@@ -1435,9 +1503,17 @@ void EncodedLiteral::write_uint(size_t ofs, size_t size,  uint64_t v)
         }
     }
 }
+void EncodedLiteral::write_usize(size_t ofs,  uint64_t v)
+{
+    this->write_uint(ofs, Target_GetPointerBits() / 8, v);
+}
+uint64_t EncodedLiteral::read_usize(size_t ofs) const
+{
+    return EncodedLiteralSlice(*this).slice(ofs).read_uint(Target_GetPointerBits() / 8);
+}
 uint64_t EncodedLiteralSlice::read_uint(size_t size/*=0*/) const {
     if(size == 0)   size = m_size;
-    assert(size <= m_size);
+    ASSERT_BUG(Span(), size <= m_size, "Over-large read (" << size << " > " << m_size << ")");
     uint64_t v = 0;
     for(size_t i = 0; i < size; i ++) {
         size_t bit = (Target_GetCurSpec().m_arch.m_big_endian ? (size-1-i)*8 : i*8 );
@@ -1503,6 +1579,41 @@ bool EncodedLiteralSlice::operator==(const EncodedLiteralSlice& x) const
         }
     }
     return true;
+}
+
+Ordering EncodedLiteralSlice::ord(const EncodedLiteralSlice& x) const
+{
+    // NOTE: Check the data first (to maintain some level of lexical ordering)
+    auto min_size = std::min(m_size, x.m_size);
+    for(size_t i = 0; i < min_size; i ++)
+        if(auto cmp = ::ord(m_base.bytes[m_ofs + i], x.m_base.bytes[x.m_ofs + i]))
+            return cmp;
+    if( auto cmp = ::ord(m_size, x.m_size) )
+        return cmp;
+
+    auto it1 = std::find_if(  m_base.relocations.begin(),   m_base.relocations.end(), [&](const Reloc& r){ return r.ofs >=   m_ofs; });
+    auto it2 = std::find_if(x.m_base.relocations.begin(), x.m_base.relocations.end(), [&](const Reloc& r){ return r.ofs >= x.m_ofs; });
+
+    for(; it1 != m_base.relocations.end() && it2 != x.m_base.relocations.end(); ++it1, ++it2)
+    {
+        if( auto cmp = ::ord(it1->ofs - m_ofs, it2->ofs - x.m_ofs) )
+            return cmp;
+        if( auto cmp = ::ord(it1->len, it2->len) )
+            return cmp;
+        if( auto cmp = ::ord(bool(it1->p), bool(it2->p)) )
+            return cmp;
+        if( it1->p )
+        {
+            if( auto cmp = ::ord(*it1->p, *it2->p) )
+                return cmp;
+        }
+        else
+        {
+            if(auto cmp = ::ord(it1->bytes, it2->bytes) )
+                return cmp;
+        }
+    }
+    return OrdEqual;
 }
 
 ::std::ostream& operator<<(std::ostream& os, const EncodedLiteralSlice& x) {

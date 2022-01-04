@@ -13,6 +13,8 @@ TTStream::TTStream(Span parent, ParseState ps, const TokenTree& input_tt):
     m_parent_span( mv$(parent) )
 {
     DEBUG("input_tt = [" << input_tt << "]");
+    DEBUG("Set edition " << input_tt.get_edition());
+    m_edition = input_tt.get_edition();
     m_stack.push_back( ::std::make_pair(0, &input_tt) );
 }
 TTStream::~TTStream()
@@ -30,6 +32,7 @@ Token TTStream::realGetToken()
         if(idx == 0 && tree.is_token()) {
             idx ++;
             m_hygiene_ptr = &tree.hygiene();
+            DEBUG(tree.tok());
             return tree.tok();
         }
 
@@ -39,14 +42,21 @@ Token TTStream::realGetToken()
             idx ++;
             if( subtree.size() == 0 ) {
                 m_hygiene_ptr = &subtree.hygiene();
+                DEBUG(subtree.tok());
                 return subtree.tok().clone();
             }
             else {
                 m_stack.push_back( ::std::make_pair(0, &subtree) );
+                DEBUG("Set edition " << m_edition << " -> " << subtree.get_edition());
+                m_edition = subtree.get_edition();
             }
         }
         else {
             m_stack.pop_back();
+            if(!m_stack.empty()) {
+                DEBUG("Restore edition " << m_edition << " -> " << m_stack.back().second->get_edition());
+                m_edition = m_stack.back().second->get_edition();
+            }
         }
     }
     //m_hygiene = nullptr;
@@ -56,6 +66,10 @@ Position TTStream::getPosition() const
 {
     // TODO: Position associated with the previous/next token?
     return Position("TTStream", 0,0);
+}
+AST::Edition TTStream::realGetEdition() const
+{
+    return m_edition;
 }
 Ident::Hygiene TTStream::realGetHygiene() const
 {
@@ -87,6 +101,7 @@ Token TTStreamO::realGetToken()
         if(idx == 0 && tree.is_token()) {
             idx ++;
             m_last_pos = tree.tok().get_pos();
+            m_edition = tree.get_edition();
             m_hygiene_ptr = &tree.hygiene();
             return mv$(tree.tok());
         }
@@ -97,6 +112,7 @@ Token TTStreamO::realGetToken()
             idx ++;
             if( subtree.size() == 0 ) {
                 m_last_pos = subtree.tok().get_pos();
+                m_edition = subtree.get_edition();
                 m_hygiene_ptr = &subtree.hygiene();
                 return mv$( subtree.tok() );
             }
@@ -109,6 +125,10 @@ Token TTStreamO::realGetToken()
         }
     }
     return Token(TOK_EOF);
+}
+AST::Edition TTStreamO::realGetEdition() const
+{
+    return m_edition;
 }
 Position TTStreamO::getPosition() const
 {

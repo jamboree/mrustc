@@ -27,6 +27,14 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
     const ::AST::Path& path, ::std::span< const ::AST::Module* > parent_modules,
     bool types_only=false
     );
+
+::AST::Path::Bindings Resolve_Use_GetBinding_Mod(
+    const Span& span,
+    const ::AST::Crate& crate, const ::AST::AbsolutePath& source_mod_path, const ::AST::Module& mod,
+    const RcString& des_item_name,
+    ::std::span< const ::AST::Module* > parent_modules,
+    bool types_only = false
+    );
 ::AST::Path::Bindings Resolve_Use_GetBinding__ext(const Span& span, const ::AST::Crate& crate, const AST::ExternCrate& ec, const ::HIR::Module& hmodr, const ::AST::Path& path, unsigned int start, AST::AbsolutePath ap={});
 ::AST::Path::Bindings Resolve_Use_GetBinding__ext(const Span& span, const ::AST::Crate& crate, const ::AST::Path& path,  const AST::ExternCrate& ec, unsigned int start);
 
@@ -72,11 +80,66 @@ void Resolve_Use(::AST::Crate& crate)
             }
         }
 
+        // If there's only one node, then check for primitives.
+        if(path.nodes().size() == 1) {
+            auto ct = coretype_fromstring(path.nodes()[0].name().c_str());
+            if( ct != CORETYPE_INVAL ) {
+                DEBUG("Found builtin type for `use` - " << path);
+                // TODO: only if the item doesn't already exist?
+                return AST::Path(CRATE_BUILTINS, path.nodes());
+            }
+        }
+
         // EVIL HACK: If the current module is an anon module, refer to the parent
+        // TODO: Check if the desired item is in this module, 
         if( base_path.nodes().size() > 0 && base_path.nodes().back().name().c_str()[0] == '#' ) {
+
+            std::vector<const AST::Module*>   parent_mods;
+            const AST::Module* cur_mod = &crate.m_root_module;
+            parent_mods.push_back(cur_mod);
+            for( unsigned int i = 0; i < base_path.nodes().size(); i ++ )
+            {
+                const auto& name = base_path.nodes()[i].name();
+                const AST::Module* next_mod = nullptr;
+
+                // If the desired item is an anon module (starts with #) then parse and index
+                if( name.size() > 0 && name.c_str()[0] == '#' ) {
+                    unsigned int idx = 0;
+                    if( ::std::sscanf(name.c_str(), "#%u", &idx) != 1 ) {
+                        BUG(span, "Invalid anon path segment '" << name << "'");
+                    }
+                    ASSERT_BUG(span, idx < cur_mod->anon_mods().size(), "Invalid anon path segment '" << name << "'");
+                    assert( cur_mod->anon_mods()[idx] );
+                    next_mod = &*cur_mod->anon_mods()[idx];
+                }
+                else {
+                    for(const auto& item : cur_mod->m_items) {
+                        if( item->name == name && item->data.is_Module() ) {
+                            next_mod = &item->data.as_Module();
+                            break;
+                        }
+                    }
+                }
+                assert(next_mod);
+                cur_mod = next_mod;
+                if( name.c_str()[0] != '#' ) {
+                    parent_mods.clear();
+                }
+                parent_mods.push_back(cur_mod);
+            }
+            parent_mods.pop_back();
+            DEBUG("parent_mods.size() = " << parent_mods.size());
+
+            while( !parent_mods.empty() && !Resolve_Use_GetBinding_Mod(span, crate, parent_mods[0]->path(), *cur_mod, e.nodes.front().name(), parent_mods, /*types_only*/e.nodes.size() > 1).has_binding() )
+            {
+                cur_mod = parent_mods.back();
+                parent_mods.pop_back();
+            }
+            DEBUG("Found item in " << cur_mod->path());
+
             AST::Path   np("", {});
-            for( unsigned int i = 0; i < base_path.nodes().size() - 1; i ++ )
-                np.nodes().push_back( base_path.nodes()[i] );
+            for( unsigned int i = 0; i < cur_mod->path().nodes.size(); i ++ )
+                np.nodes().push_back( cur_mod->path().nodes[i] );
             np += path;
             return np;
         }
@@ -190,11 +253,11 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
         const AST::Crate& crate;
         ::std::vector< const AST::Module* >   parent_modules;
 
-        NV(const AST::Crate& crate, const AST::Module& cur_module):
+        NV(const AST::Crate& crate, const AST::Module& cur_module, ::std::span< const AST::Module* > parent_modules):
             crate(crate),
-            parent_modules()
+            parent_modules(parent_modules.begin(), parent_modules.end())
         {
-            parent_modules.push_back( &cur_module );
+            this->parent_modules.push_back( &cur_module );
         }
 
         void visit(AST::ExprNode_Block& node) override {
@@ -208,20 +271,20 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                 parent_modules.pop_back();
             }
         }
-    } expr_iter(crate, mod);
+    } expr_iter(crate, mod, parent_modules);
 
     // TODO: Check that all code blocks are covered by these
     // - NOTE: Handle anon modules by iterating code (allowing correct item mappings)
     for(auto& ip : mod.m_items)
     {
         auto& i = *ip;
-        TU_MATCH_DEF( AST::Item, (i.data), (e),
-        (
-            ),
-        (Module,
-            Resolve_Use_Mod(crate, i.data.as_Module(), path + i.name);
-            ),
-        (Impl,
+        TU_MATCH_HDRA( (i.data),  {)
+        default:
+            break;
+        TU_ARMA(Module, e) {
+            Resolve_Use_Mod(crate, e, path + i.name);
+            }
+        TU_ARMA(Impl, e) {
             for(auto& i : e.items())
             {
                 TU_MATCH_DEF( AST::Item, (*i.data), (e),
@@ -239,8 +302,8 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                     )
                 )
             }
-            ),
-        (Trait,
+            }
+        TU_ARMA(Trait, e) {
             for(auto& ti : e.items())
             {
                 TU_MATCH_DEF( AST::Item, (ti.data), (e),
@@ -267,18 +330,18 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                     )
                 )
             }
-            ),
-        (Function,
+            }
+        TU_ARMA(Function, e) {
             if( e.code().is_valid() ) {
                 e.code().node().visit( expr_iter );
             }
-            ),
-        (Static,
+            }
+        TU_ARMA(Static, e) {
             if( e.value().is_valid() ) {
                 e.value().node().visit( expr_iter );
             }
-            )
-        )
+            }
+        }
     }
 }
 
@@ -287,7 +350,7 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
         const ::AST::Crate& crate, const ::AST::AbsolutePath& source_mod_path, const ::AST::Module& mod,
         const RcString& des_item_name,
         ::std::span< const ::AST::Module* > parent_modules,
-        bool types_only = false
+        bool types_only// = false
     )
 {
     ::AST::Path::Bindings   rv;
@@ -353,6 +416,9 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                 }
             TU_ARMA(Trait, e) {
                 rv.type.set(p, ::AST::PathBinding_Type::make_Trait({&e}));
+                }
+            TU_ARMA(TraitAlias, e) {
+                rv.type.set(p, ::AST::PathBinding_Type::make_TraitAlias({&e}));
                 }
 
             TU_ARMA(Function, e) {
@@ -465,6 +531,7 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                         bindings_ = Resolve_Use_GetBinding(sp2, crate, mod.path(), Resolve_Use_AbsolutisePath(sp2, crate, mod.path(), imp_e.path), parent_modules, /*type_only=*/true);
                         if( bindings_.type.is_Unbound() ) {
                             DEBUG("Recursion detected, skipping " << imp_e.path);
+                            resolve_stack_ptrs.pop_back();
                             continue ;
                         }
                         // *waves hand* I'm not evil.
@@ -484,7 +551,7 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                 TU_MATCH_HDRA( (bindings->type.binding), {)
                 TU_ARMA(Crate, e) {
                     assert(e.crate_);
-                    const ::HIR::Module& hmod = e.crate_->m_hir->m_root_module;
+                    //const ::HIR::Module& hmod = e.crate_->m_hir->m_root_module;
                     rv.merge_from( Resolve_Use_GetBinding__ext(sp2, crate, AST::Path("", { AST::PathNode(des_item_name,{}) }), *e.crate_, 0) );
                     }
                 TU_ARMA(Module, e) {
@@ -772,6 +839,9 @@ namespace {
                     ),
                 (Trait,
                     rv.type.set( ap, ::AST::PathBinding_Type::make_Trait({nullptr, &e}) );
+                    ),
+                (TraitAlias,
+                    rv.type.set( ap, ::AST::PathBinding_Type::make_TraitAlias({nullptr, &e}) );
                     )
                 )
             }
@@ -926,7 +996,7 @@ namespace {
     //::AST::Path rv;
 
     // If the path is directly referring to an external crate - call __ext
-    if( path.m_class.is_Absolute() && path.m_class.as_Absolute().crate != "" ) {
+    if( path.m_class.is_Absolute() && (path.m_class.as_Absolute().crate != "" && path.m_class.as_Absolute().crate != crate.m_crate_name_real) ) {
         const auto& path_abs = path.m_class.as_Absolute();
         // Builtin macro imports
         if(path_abs.crate == CRATE_BUILTINS)

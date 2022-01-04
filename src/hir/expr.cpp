@@ -38,6 +38,26 @@ DEF_VISIT(ExprNode_Asm, node,
     for(auto& v : node.m_inputs)
         visit_node_ptr(v.value);
 )
+DEF_VISIT(ExprNode_Asm2, node,
+    for(auto& v : node.m_params)
+    {
+        TU_MATCH_HDRA( (v), { )
+        TU_ARMA(Const, e) {
+            visit_node_ptr(e);
+            }
+        TU_ARMA(Sym, e) {
+            visit_path(::HIR::Visitor::PathContext::VALUE, e);
+            }
+        TU_ARMA(RegSingle, e) {
+            visit_node_ptr(e.val);
+            }
+        TU_ARMA(Reg, e) {
+            if(e.val_in)    visit_node_ptr(e.val_in);
+            if(e.val_out)   visit_node_ptr(e.val_out);
+            }
+        }
+    }
+)
 DEF_VISIT(ExprNode_Return, node,
     visit_node_ptr(node.m_value);
 )
@@ -90,6 +110,9 @@ DEF_VISIT(ExprNode_UniOp, node,
     visit_node_ptr(node.m_value);
 )
 DEF_VISIT(ExprNode_Borrow, node,
+    visit_node_ptr(node.m_value);
+)
+DEF_VISIT(ExprNode_RawBorrow, node,
     visit_node_ptr(node.m_value);
 )
 DEF_VISIT(ExprNode_Cast, node,
@@ -185,7 +208,7 @@ DEF_VISIT(ExprNode_ArrayList, node,
 )
 DEF_VISIT(ExprNode_ArraySized, node,
     visit_node_ptr(node.m_val);
-    //visit_node_ptr(node.m_size);
+    //visit_arraysize(node.m_size); // Don't do this, array sizes are not part of the normal expression tree
 )
 
 DEF_VISIT(ExprNode_Closure, node,
@@ -285,6 +308,10 @@ void ::HIR::ExprVisitorDef::visit_pattern(const Span& sp, ::HIR::Pattern& pat)
         for(auto& subpat : e.trailing)
             this->visit_pattern(sp, subpat);
         }
+    TU_ARMA(Or, e) {
+        for(auto& subpat : e)
+            this->visit_pattern(sp, subpat);
+        }
     }
 }
 void ::HIR::ExprVisitorDef::visit_type(::HIR::TypeRef& ty)
@@ -315,7 +342,6 @@ void ::HIR::ExprVisitorDef::visit_type(::HIR::TypeRef& ty)
         ),
     (Array,
         this->visit_type( e.inner );
-        //this->visit_expr( e.size );
         ),
     (Slice,
         this->visit_type( e.inner );

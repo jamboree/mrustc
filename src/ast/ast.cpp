@@ -14,6 +14,11 @@
 #include "../parse/parseerror.hpp"
 #include <algorithm>
 
+#include <parse/ttstream.hpp>
+#include <parse/common.hpp>
+#include <parse/interpolated_fragment.hpp>
+#include <synext.hpp>   // Expand_ParseAndExpand_ExprVal
+
 namespace AST {
 
 
@@ -56,7 +61,7 @@ const Attribute* AttributeList::get(const char *name) const
 ::std::ostream& operator<<(::std::ostream& os, const AttributeName& x) {
     if(x.elems.empty())
     {
-        os << "''";
+        os << "<empty>";
     }
     else
     {
@@ -70,25 +75,61 @@ const Attribute* AttributeList::get(const char *name) const
     return os;
 }
 
+Attribute::Attribute(const Attribute& x):
+    m_span(x.m_span),
+    m_name(x.m_name)
+    , m_data(x.m_data.clone())
+    , m_is_used(x.m_is_used)
+{
+}
 Attribute Attribute::clone() const
 {
-    struct H {
-        static AttributeData clone_ad(const AttributeData& ad) {
-            TU_MATCHA( (ad), (e),
-            (None,
-                return AttributeData::make_None({});
-                ),
-            (String,
-                return AttributeData::make_String({ e.val });
-                ),
-            (List,
-                return AttributeData::make_List({ clone_mivec(e.sub_items) });
-                )
-            )
-            throw ::std::runtime_error("Attribute::clone - Fell off end");
-        }
-    };
-    return Attribute(m_span, m_name, H::clone_ad(m_data));
+    return Attribute(*this);
+}
+void Attribute::fmt(std::ostream& os) const
+{
+    os << m_name;
+    os << m_data;
+}
+
+
+std::string Attribute::parse_equals_string(const AST::Crate& crate, const AST::Module& mod) const
+{
+    TTStream    lex(this->m_span, ParseState(), this->data());
+    lex.getTokenCheck(TOK_EQUAL);
+    auto n = Expand_ParseAndExpand_ExprVal(crate, mod, lex);
+
+    std::string rv;
+    if( auto* v = dynamic_cast<::AST::ExprNode_String*>(&*n) ) {
+        rv = v->m_value;
+    }
+    else
+    {
+        throw ParseError::Unexpected(lex, Token(InterpolatedFragment(InterpolatedFragment::EXPR, n.release())), TOK_STRING);
+    }
+    lex.getTokenCheck(TOK_EOF);
+    return rv;
+}
+
+std::string Attribute::parse_paren_string() const
+{
+    TTStream    lex(this->m_span, ParseState(), this->data());
+    lex.getTokenCheck(TOK_PAREN_OPEN);
+    auto rv = lex.getTokenCheck(TOK_STRING).str();
+    lex.getTokenCheck(TOK_PAREN_CLOSE);
+    return rv;
+}
+void Attribute::parse_paren_ident_list(std::function<void(const Span& sp, RcString ident)> item_cb) const
+{
+    TTStream    lex(this->m_span, ParseState(), this->data());
+    lex.getTokenCheck(TOK_PAREN_OPEN);
+    while(lex.lookahead(0) != TOK_PAREN_CLOSE) {
+        item_cb(lex.point_span(), lex.getTokenCheck(TOK_IDENT).ident().name);
+        if(lex.lookahead(0) != TOK_COMMA)
+            break;
+        lex.getTokenCheck(TOK_COMMA);
+    }
+    lex.getTokenCheck(TOK_PAREN_CLOSE);
 }
 
 StructItem StructItem::clone() const
@@ -125,7 +166,7 @@ Function Function::clone() const
 {
     decltype(m_args)    new_args;
     for(const auto& arg : m_args)
-        new_args.push_back( ::std::make_pair( arg.first.clone(), arg.second.clone() ) );
+        new_args.push_back( AST::Function::Arg( arg.pat.clone(), arg.ty.clone(), arg.attrs.clone() ) );
 
     auto rv = Function( m_span, m_params.clone(), m_abi, m_is_unsafe, m_is_const, m_is_variadic, m_rettype.clone(), mv$(new_args) );
     if( m_code.is_valid() )
@@ -328,6 +369,8 @@ void Module::add_macro_invocation(MacroInvocation item) {
     this->add_item( item.span(), false, "", Item( mv$(item) ), ::AST::AttributeList {} );
 }
 void Module::add_macro(bool is_exported, RcString name, MacroRulesPtr macro) {
+    assert(macro);
+    assert(macro->m_rules.size() > 0);
     m_macros.push_back( Named<MacroRulesPtr>( Span(), {}, /*is_pub=*/is_exported, mv$(name), mv$(macro) ) );
 }
 
@@ -374,6 +417,9 @@ Item Item::clone() const
         return AST::Item(e.clone());
         ),
     (Trait,
+        return AST::Item(e.clone());
+        ),
+    (TraitAlias,
         return AST::Item(e.clone());
         ),
 

@@ -13,6 +13,15 @@ namespace {
 
     const ::HIR::GenericParams& get_params_for_item(const Span& sp, const ::HIR::Crate& crate, const ::HIR::SimplePath& path, ::HIR::Visitor::PathContext pc)
     {
+        // Support for enum variants
+        if( path.m_components.size() > 1 )
+        {
+            const auto& pitem = crate.get_typeitem_by_path(sp, path, false, true);
+            if(pitem.is_Enum() ) {
+                return pitem.as_Enum().m_params;
+            }
+        }
+
         switch( pc )
         {
         case ::HIR::Visitor::PathContext::VALUE: {
@@ -51,6 +60,9 @@ namespace {
                 ),
             (TypeAlias,
                 BUG(sp, "Type path pointed to type alias - " << path);
+                ),
+            (TraitAlias,
+                BUG(sp, "Type path pointed to trait alias - " << path);
                 ),
             (ExternType,
                 static ::HIR::GenericParams empty_params;
@@ -123,6 +135,7 @@ namespace {
             return rv;
         }
 
+#if 0
         void update_self_type(const Span& sp, ::HIR::TypeRef& ty) const
         {
             struct H {
@@ -134,7 +147,7 @@ namespace {
 
             TU_MATCH(::HIR::TypeData, (ty.data_mut()), (e),
             (Generic,
-                if(e.name == "Self") {
+                if(e.name == "Self" || e.binding == GENERIC_Self) {
                     if( m_self_types.empty() )
                         ERROR(sp, E0000, "Self appeared in unexpected location");
                     if( !m_self_types.back() )
@@ -204,8 +217,11 @@ namespace {
                 )
             )
         }
+#endif
         void check_parameters(const Span& sp, const ::HIR::GenericParams& param_def,  ::HIR::PathParams& param_vals)
         {
+            MonomorphStatePtr ms(m_self_types.empty() ? nullptr : m_self_types.back(), &param_vals, nullptr);
+
             while( param_vals.m_types.size() < param_def.m_types.size() ) {
                 unsigned int i = param_vals.m_types.size();
                 const auto& ty_def = param_def.m_types[i];
@@ -214,11 +230,8 @@ namespace {
                 }
 
                 // Replace and expand
-                param_vals.m_types.push_back( ty_def.m_default.clone_shallow() );
-                auto& ty = param_vals.m_types.back();
-                // TODO: Monomorphise?
-                // Replace `Self` here with the real Self
-                update_self_type(sp, ty);
+                param_vals.m_types.push_back( ms.monomorph_type(sp, ty_def.m_default) );
+                DEBUG("Add missing param (using default): " << param_vals.m_types.back());
             }
 
             if( param_vals.m_types.size() != param_def.m_types.size() ) {
@@ -228,11 +241,13 @@ namespace {
             for(unsigned int i = 0; i < param_vals.m_types.size(); i ++)
             {
                 if( param_vals.m_types[i] == ::HIR::TypeRef() ) {
+                    // TODO: Why is this pulling in the default? Why not just leave it as-is
+
                     //if( param_def.m_types[i].m_default == ::HIR::TypeRef() )
                     //    ERROR(sp, E0000, "Unspecified parameter with no default");
                     // TODO: Monomorphise?
-                    param_vals.m_types[i] = param_def.m_types[i].m_default.clone_shallow();
-                    update_self_type(sp, param_vals.m_types[i]);
+                    param_vals.m_types[i] = ms.monomorph_type(sp, param_def.m_types[i].m_default);
+                    DEBUG("Update `_` param (using default): " << param_def.m_types[i].m_default << " -> " << param_vals.m_types[i]);
                 }
             }
 
@@ -262,12 +277,22 @@ namespace {
         {
             static Span _sp;
             const Span& sp = _sp;
+
+            HIR::TypeRef    self("Self", GENERIC_Self);
+            if( ty.data().is_ErasedType() ) {
+                m_self_types.push_back(&self);
+            }
+
             ::HIR::Visitor::visit_type(ty);
+
+            if( ty.data().is_ErasedType() ) {
+                m_self_types.pop_back();
+            }
 
             #if 0
             if( const auto* te = ty.m_data.opt_Generic() )
             {
-                if(te->name == "Self" && te->binding == 0xFFFF) {
+                if(te->name == "Self" && te->binding == GENERIC_Self) {
                     if( m_self_types.empty() )
                         ERROR(sp, E0000, "Self appeared in unexpected location");
                     if( !m_self_types.back() )
@@ -327,7 +352,7 @@ namespace {
                                 e2.impl_params.m_types.push_back( ::HIR::TypeRef(ty.m_name, &ty - &m_resolve.m_impl_generics->m_types.front()) );
                             }
                             for(const auto& c : m_resolve.m_impl_generics->m_values) {
-                                e2.impl_params.m_values.push_back( ::HIR::Literal( ::HIR::GenericRef(c.m_name, &c - &m_resolve.m_impl_generics->m_values.front()) ) );
+                                e2.impl_params.m_values.push_back( ::HIR::GenericRef(c.m_name, &c - &m_resolve.m_impl_generics->m_values.front()) );
                             }
                             }
                         TU_ARMA(UfcsKnown, e2) {
@@ -346,7 +371,7 @@ namespace {
                         size_t idx = m_fcn_ptr->m_params.m_types.size();
                         auto name = RcString::new_interned(FMT("erased$" << idx));
                         auto new_ty = ::HIR::TypeRef( name, 256 + idx );
-                        m_fcn_ptr->m_params.m_types.push_back({ name, ::HIR::TypeRef(), true });
+                        m_fcn_ptr->m_params.m_types.push_back({ name, ::HIR::TypeRef(), e->m_is_sized });
                         for( const auto& trait : e->m_traits )
                         {
                             m_fcn_ptr->m_params.m_bounds.push_back(::HIR::GenericBound::make_TraitBound({
@@ -684,7 +709,7 @@ namespace {
         void visit_associatedtype(::HIR::ItemPath p, ::HIR::AssociatedType& item) override
         {
             // Push `Self = <Self as CurTrait>::Type` for processing defaults in the bounds.
-            auto path_aty = ::HIR::Path( ::HIR::TypeRef("Self", 0xFFFF), this->get_current_trait_gp(), p.get_name() );
+            auto path_aty = ::HIR::Path( ::HIR::TypeRef("Self", GENERIC_Self), this->get_current_trait_gp(), p.get_name() );
             auto ty_aty = ::HIR::TypeRef::new_path( mv$(path_aty), ::HIR::TypePathBinding::make_Opaque({}) );
             m_self_types.push_back(&ty_aty);
 
@@ -744,11 +769,13 @@ namespace {
             // - Done first so the path in return-position `impl Trait` is valid
             for(auto& arg : item.m_args)
             {
+                DEBUG("ARG " << arg);
                 visit_type(arg.second);
             }
             // Visit return type (populates path for `impl Trait` in return position
             m_fcn_path = &p;
             m_fcn_erased_count = 0;
+            DEBUG("RET " << item.m_return);
             visit_type(item.m_return);
             m_fcn_path = nullptr;
             m_fcn_ptr = nullptr;

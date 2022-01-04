@@ -12,6 +12,7 @@
 #include "../ast/crate.hpp"
 #include <hir/hir.hpp>  // ABI_RUST
 #include <parse/common.hpp>    // Parse_ModRoot_Items
+#include <parse/ttstream.hpp>
 #include "proc_macro.hpp"
 #include "common.hpp"   // Expand_LookupMacro
 
@@ -90,7 +91,7 @@ static ::std::vector<AST::ExprNodeP> make_refpat_a(
 }
 static ::std::vector<AST::ExprNodeP> make_refpat_a(
         const Span& sp,
-        ::std::vector< ::std::pair<RcString, AST::Pattern> >&   pats_a,
+        ::std::vector< AST::StructPatternEntry>&   pats_a,
         const ::std::vector<AST::StructItem>& fields,
         ::std::function<AST::ExprNodeP(size_t, AST::ExprNodeP)> cb
     )
@@ -100,7 +101,7 @@ static ::std::vector<AST::ExprNodeP> make_refpat_a(
     for( const auto& fld : fields )
     {
         auto name_a = RcString::new_interned(FMT("a" << fld.m_name));
-        pats_a.push_back( ::std::make_pair(fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_a, ::AST::PatternBinding::Type::REF)) );
+        pats_a.push_back(AST::StructPatternEntry { AST::AttributeList(), fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_a, ::AST::PatternBinding::Type::REF) });
         nodes.push_back( cb(idx, NEWNODE(NamedValue, AST::Path(name_a))) );
         idx ++;
     }
@@ -127,8 +128,8 @@ static ::std::vector<AST::ExprNodeP> make_refpat_ab(
 }
 static ::std::vector<AST::ExprNodeP> make_refpat_ab(
         const Span& sp,
-        ::std::vector< ::std::pair<RcString, AST::Pattern> >&   pats_a,
-        ::std::vector< ::std::pair<RcString, AST::Pattern> >&   pats_b,
+        ::std::vector<AST::StructPatternEntry>&   pats_a,
+        ::std::vector<AST::StructPatternEntry>&   pats_b,
         const ::std::vector<AST::StructItem>& fields,
         ::std::function<AST::ExprNodeP(size_t, AST::ExprNodeP, AST::ExprNodeP)> cb
     )
@@ -139,8 +140,8 @@ static ::std::vector<AST::ExprNodeP> make_refpat_ab(
     {
         auto name_a = RcString::new_interned(FMT("a" << fld.m_name));
         auto name_b = RcString::new_interned(FMT("b" << fld.m_name));
-        pats_a.push_back( ::std::make_pair(fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_a, ::AST::PatternBinding::Type::REF)) );
-        pats_b.push_back( ::std::make_pair(fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_b, ::AST::PatternBinding::Type::REF)) );
+        pats_a.push_back(AST::StructPatternEntry { AST::AttributeList(), fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_a, ::AST::PatternBinding::Type::REF) });
+        pats_b.push_back(AST::StructPatternEntry { AST::AttributeList(), fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_b, ::AST::PatternBinding::Type::REF) });
         nodes.push_back( cb(idx, NEWNODE(NamedValue, AST::Path(name_a)), NEWNODE(NamedValue, AST::Path(name_b))) );
         idx ++;
     }
@@ -151,7 +152,6 @@ static ::std::vector<AST::ExprNodeP> make_refpat_ab(
 struct DeriveOpts
 {
     RcString core_name;
-    const ::std::vector<::AST::Attribute>&  derive_items;
 };
 
 /// Interface for derive handlers
@@ -393,9 +393,9 @@ class Deriver_Debug:
             ABI_RUST, false, false, false,
             TypeRef(sp, get_path(core_name, "fmt", "Result")),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"),
                     TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "f"),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "f"),
                     TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), true, TypeRef(sp, get_path(core_name, "fmt", "Formatter")) ) )
                 )
             );
@@ -427,15 +427,15 @@ public:
             }
         TU_ARMA(Struct, e) {
             node = NEWNODE(NamedValue, AST::Path("f"));
-            node = NEWNODE(CallMethod,
-                mv$(node), AST::PathNode("debug_struct",{}),
-                vec$( NEWNODE(String, name) )
-                );
-            // TODO: use a block instead of chaining
+            std::vector<AST::ExprNodeP> nodes;
+            nodes.push_back(NEWNODE(LetBinding, AST::Pattern(AST::Pattern::TagBind(), sp, "s"), TypeRef(sp), NEWNODE(CallMethod,
+                    mv$(node), AST::PathNode("debug_struct",{}),
+                    vec$( NEWNODE(String, name) )
+                )));
             for( const auto& fld : e.ents )
             {
-                node = NEWNODE(CallMethod,
-                    mv$(node), AST::PathNode("field",{}),
+                nodes.push_back(NEWNODE(CallMethod,
+                    NEWNODE(NamedValue, AST::Path("s")), AST::PathNode("field",{}),
                     vec$(
                         NEWNODE(String, fld.m_name.c_str()),
                         NEWNODE(UniOp, AST::ExprNode_UniOp::REF, NEWNODE(UniOp, AST::ExprNode_UniOp::REF,
@@ -445,9 +445,10 @@ public:
                                 )
                             ))
                     )
-                    );
+                    ));
             }
-            node = NEWNODE(CallMethod, mv$(node), AST::PathNode("finish",{}), {});
+            nodes.push_back(NEWNODE(CallMethod, NEWNODE(NamedValue, AST::Path("s")), AST::PathNode("finish",{}), {}));
+            node = NEWNODE(Block, false, /*yields_final_value*/true, mv$(nodes), {});
             }
         TU_ARMA(Tuple, e) {
             node = NEWNODE(NamedValue, AST::Path("f"));
@@ -514,7 +515,7 @@ public:
                 pat_a = AST::Pattern(AST::Pattern::TagNamedTuple(), sp, variant_path, mv$(pats_a));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
+                ::std::vector< AST::StructPatternEntry> pats_a;
 
                 auto s_ent = NEWNODE(NamedValue, AST::Path("s"));
                 auto nodes = make_refpat_a(sp, pats_a, e.m_fields, [&](size_t idx, auto a){
@@ -568,8 +569,8 @@ class Deriver_PartialEq:
             ABI_RUST, false, false, false,
             TypeRef(sp, CORETYPE_BOOL),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "v"   ), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "v"   ), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
                 )
             );
         fcn.set_code( NEWNODE(Block, vec$(mv$(node))) );
@@ -656,8 +657,8 @@ public:
                 code = NEWNODE(Block, mv$(nodes));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_b;
+                ::std::vector<AST::StructPatternEntry> pats_a;
+                ::std::vector<AST::StructPatternEntry> pats_b;
 
                 auto nodes = make_refpat_ab(sp, pats_a, pats_b, e.m_fields, [&](const auto& name, auto a, auto b){
                         return this->compare_and_ret(sp, opts.core_name, mv$(a), mv$(b));
@@ -721,8 +722,8 @@ class Deriver_PartialOrd:
             ABI_RUST, false, false, false,
             TypeRef(sp, path_option_ordering),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "v"   ), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "v"   ), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
                 )
             );
         fcn.set_code( NEWNODE(Block, vec$(mv$(node))) );
@@ -838,8 +839,8 @@ public:
                 code = NEWNODE(Block, mv$(nodes));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_b;
+                ::std::vector<AST::StructPatternEntry> pats_a;
+                ::std::vector<AST::StructPatternEntry> pats_b;
 
                 auto nodes = make_refpat_ab(sp, pats_a, pats_b, e.m_fields, [&](size_t /*idx*/, auto a, auto b){
                         return this->make_compare_and_ret(sp, opts.core_name, NEWNODE(Deref, mv$(a)), NEWNODE(Deref, mv$(b)));
@@ -913,7 +914,7 @@ class Deriver_Eq:
             ABI_RUST, false, false, false,
             TypeRef(TypeRef::TagUnit(), sp),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
                 )
             );
         fcn.set_code( NEWNODE(Block, vec$(mv$(node))) );
@@ -994,7 +995,7 @@ public:
                 code = NEWNODE(Block, mv$(nodes));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
+                ::std::vector<AST::StructPatternEntry> pats_a;
                 auto nodes = make_refpat_a(sp, pats_a, e.m_fields, [&](size_t idx, auto a){
                     return this->assert_is_eq(assert_method_path, mv$(a));
                     });
@@ -1049,8 +1050,8 @@ class Deriver_Ord:
             ABI_RUST, false, false, false,
             TypeRef(sp, path_ordering),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "v"   ), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "v"   ), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
                 )
             );
         fcn.set_code( NEWNODE(Block, vec$(mv$(node))) );
@@ -1158,8 +1159,8 @@ public:
                 code = NEWNODE(Block, mv$(nodes));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_b;
+                ::std::vector<AST::StructPatternEntry> pats_a;
+                ::std::vector<AST::StructPatternEntry> pats_b;
 
                 auto nodes = make_refpat_ab(sp, pats_a, pats_b, e.m_fields, [&](const auto& /*name*/, auto a, auto b) {
                         return this->make_compare_and_ret(sp, opts.core_name, mv$(a), mv$(b));
@@ -1234,7 +1235,7 @@ class Deriver_Clone:
             ABI_RUST, false, false, false,
             TypeRef(sp, "Self", 0xFFFF),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) )
                 )
             );
         fcn.set_code( NEWNODE(Block, vec$(mv$(node))) );
@@ -1324,13 +1325,13 @@ public:
                 code = NEWNODE(CallPath, base_path + v.m_name, mv$(nodes));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
+                ::std::vector<AST::StructPatternEntry> pats_a;
                 ::AST::ExprNode_StructLiteral::t_values vals;
 
                 for( const auto& fld : e.m_fields )
                 {
                     auto name_a = RcString::new_interned(FMT("a" << fld.m_name));
-                    pats_a.push_back( ::std::make_pair(fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_a, ::AST::PatternBinding::Type::REF)) );
+                    pats_a.push_back(AST::StructPatternEntry { AST::AttributeList(), fld.m_name, ::AST::Pattern(::AST::Pattern::TagBind(), sp, name_a, ::AST::PatternBinding::Type::REF) });
                     vals.push_back({ {}, fld.m_name, this->clone_val_direct(opts.core_name, NEWNODE(NamedValue, AST::Path(name_a))) });
                 }
 
@@ -1514,8 +1515,8 @@ class Deriver_Hash:
             ABI_RUST, false, false, false,
             TypeRef(TypeRef::TagUnit(), sp),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "state"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), true, TypeRef(sp, "H", 0x100|0)) )
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "state"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), true, TypeRef(sp, "H", 0x100|0)) )
                 )
             );
         fcn.params().add_ty_param( AST::TypeParam(sp, {}, "H") );
@@ -1588,7 +1589,10 @@ public:
             AST::Pattern    pat_a;
 
             auto var_path = base_path + v.m_name;
-            auto var_idx_hash = this->hash_val_ref( opts.core_name, NEWNODE(Integer, var_idx, CORETYPE_UINT) );
+            auto var_idx_hash = enm.variants().size() > 1
+                ?  this->hash_val_ref( opts.core_name, NEWNODE(Integer, var_idx, CORETYPE_UINT) )
+                : NEWNODE(Tuple, {})
+                ;
 
             TU_MATCH_HDRA( (v.m_data), {)
             TU_ARMA(Value, e) {
@@ -1606,7 +1610,7 @@ public:
                 code = NEWNODE(Block, mv$(nodes));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
+                ::std::vector<AST::StructPatternEntry> pats_a;
                 auto nodes = make_refpat_a(sp, pats_a, e.m_fields, [&](size_t , auto a) {
                         return this->hash_val_direct(opts.core_name, mv$(a));
                         });
@@ -1662,8 +1666,8 @@ class Deriver_RustcEncodable:
             ABI_RUST, false, false, false,
             TypeRef(sp, mv$(result_path)),
             vec$(
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "s"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), true, TypeRef(sp, "S", 0x100|0)) )
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), false, TypeRef(sp, "Self", 0xFFFF)) ),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "s"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), true, TypeRef(sp, "S", 0x100|0)) )
                 )
             );
         fcn.params().add_ty_param( AST::TypeParam(sp, {}, "S") );
@@ -1819,7 +1823,7 @@ public:
                 pat_a = AST::Pattern(AST::Pattern::TagNamedTuple(), sp, base_path + v.m_name, mv$(pats_a));
                 }
             TU_ARMA(Struct, e) {
-                ::std::vector< ::std::pair<RcString, AST::Pattern> > pats_a;
+                ::std::vector<AST::StructPatternEntry> pats_a;
                 auto nodes = make_refpat_a(sp, pats_a, e.m_fields, [&](size_t idx, auto a){
                     return NEWNODE(CallPath, this->get_trait_path_Encoder() + RcString::new_interned("emit_enum_struct_variant_field"),
                         vec$(
@@ -1894,8 +1898,8 @@ class Deriver_RustcDecodable:
             ABI_RUST, false, false, false,
             TypeRef(sp, result_path),
             vec$(
-                //::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, false, AST::LifetimeRef(), TypeRef(sp, "Self", 0xFFFF)) ),
-                ::std::make_pair( AST::Pattern(AST::Pattern::TagBind(), sp, "d"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), true, TypeRef(sp, "D", 0x100|0)) )
+                //AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "self"), TypeRef(TypeRef::TagReference(), sp, false, AST::LifetimeRef(), TypeRef(sp, "Self", 0xFFFF)) ),
+                AST::Function::Arg( AST::Pattern(AST::Pattern::TagBind(), sp, "d"), TypeRef(TypeRef::TagReference(), sp, AST::LifetimeRef(), true, TypeRef(sp, "D", 0x100|0)) )
                 )
             );
         fcn.params().add_ty_param( AST::TypeParam(sp, {}, "D") );
@@ -2128,49 +2132,55 @@ static const Deriver* find_impl(const RcString& trait_name)
     return nullptr;
 }
 
-template<typename T>
-static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mod, const AST::Attribute& attr, const AST::AbsolutePath& path, slice<const AST::Attribute> attrs, const T& item)
-{
-    if( !attr.has_sub_items() ) {
-        //ERROR(sp, E0000, "#[derive()] requires a list of known traits to derive");
-        return ;
-    }
-
-    DEBUG("path = " << path);
-    bool    fail = false;
-
-    const auto& params = item.params();
-    TypeRef type(sp, path);
-    auto& types_args = type.path().nodes().back().args();
-    for( const auto& param : params.m_params ) {
-        if(const auto* pe = param.opt_Type())
-        {
-            types_args.m_entries.push_back( TypeRef(TypeRef::TagArg(), sp, pe->name()) );
-        }
-    }
-
-    DeriveOpts opts = {
-        crate.m_ext_cratename_core,
-        attr.items()
-        };
-
-    ::std::vector<AST::AttributeName>   missing_handlers;
-    for( const auto& trait : attr.items() )
+namespace {
+    std::vector<AST::AttributeName>   get_derive_items(const AST::Attribute& attr)
     {
-        DEBUG("- " << trait.name());
+        std::vector<AST::AttributeName> rv;
 
+        TTStream    lex(attr.span(), ParseState(), attr.data());
+        lex.getTokenCheck(TOK_PAREN_OPEN);
+        while(lex.lookahead(0) != TOK_PAREN_CLOSE) {
+
+            AST::AttributeName  item;
+            do {
+                item.elems.push_back( lex.getTokenCheck(TOK_IDENT).ident().name );
+            } while(lex.getTokenIf(TOK_DOUBLE_COLON));
+            rv.push_back(std::move(item));
+
+            if(lex.lookahead(0) != TOK_COMMA)
+                break;
+            lex.getTokenCheck(TOK_COMMA);
+        }
+        lex.getTokenCheck(TOK_PAREN_CLOSE);
+        return rv;
+    }
+
+    TypeRef make_type(const Span& sp, const AST::AbsolutePath& path, const AST::GenericParams& params)
+    {
+        TypeRef type(sp, path);
+        auto& types_args = type.path().nodes().back().args();
+        for( const auto& param : params.m_params ) {
+            if(const auto* pe = param.opt_Type())
+            {
+                types_args.m_entries.push_back( TypeRef(TypeRef::TagArg(), sp, pe->name()) );
+            }
+            if(const auto* pe = param.opt_Value())
+            {
+                auto p = AST::Path(pe->name().name);
+                types_args.m_entries.push_back( AST::ExprNodeP(new AST::ExprNode_NamedValue(std::move(p))) );
+            }
+        }
+        return type;
+    }
+
+    std::vector<RcString> find_macro(const Span& sp, const AST::Crate& crate, const AST::Module& mod, const AST::AttributeName& trait_path)
+    {
         std::vector<RcString>   mac_path;
         //auto mac_name = RcString::new_interned( FMT("derive#" << trait.name().elems.back()) );
-        auto mac_name = trait.name().elems.back();
+        auto mac_name = trait_path.elems.back();
 
-        if( trait.name().elems.size() == 1 )
+        if( trait_path.elems.size() == 1 )
         {
-            auto dp = find_impl(trait.name().elems[0]);
-            if( dp ) {
-                mod.add_item(sp, false, "", dp->handle_item(sp, opts, params, type, item), {} );
-                continue ;
-            }
-
             for(const auto& mac_import : mod.m_macro_imports)
             {
                 if( mac_import.name == mac_name )
@@ -2181,7 +2191,7 @@ static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mo
                     }
                     else {
                         // proc_macro - Invoke the handler.
-                        DEBUG("proc_macro " << mac_import.path << ", attrs = " << attrs);
+                        DEBUG("proc_macro " << mac_import.path);
                         mac_path = mac_import.path;
                         break;
                     }
@@ -2190,7 +2200,7 @@ static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mo
 
             if(mac_path.empty())
             {
-                auto p = AST::Path::new_relative(Ident::Hygiene(), {trait.name().elems[0]});
+                auto p = AST::Path::new_relative(Ident::Hygiene(), {trait_path.elems[0]});
                 auto mac = Expand_LookupMacro(sp, crate, LList<const AST::Module*>(nullptr, &mod), p);
                 
                 TU_MATCH_HDRA( (mac), {)
@@ -2211,10 +2221,10 @@ static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mo
         }
         else
         {
-            if( trait.name().elems.size() != 2 )
-                ERROR(sp, E0000, "Invalid macro path format (must be two items, got " << trait.name());
-            const auto& des_crate = trait.name().elems[0];
-            const auto& des_mac = trait.name().elems[1];
+            if( trait_path.elems.size() != 2 )
+                ERROR(sp, E0000, "Invalid macro path format (must be two items, got " << trait_path);
+            const auto& des_crate = trait_path.elems[0];
+            const auto& des_mac   = trait_path.elems[1];
             RcString    crate_name;
             RcString    mac_name;
             for(const auto& ec : crate.m_extern_crates)
@@ -2240,6 +2250,43 @@ static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mo
             }
             mac_path = make_vec2(crate_name, mac_name);
         }
+        return mac_path;
+    }
+}
+
+template<typename T>
+static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mod, const AST::Attribute& attr, const AST::AbsolutePath& path, slice<const AST::Attribute> attrs, const T& item)
+{
+    auto derive_items = get_derive_items(attr);
+    if( derive_items.empty() ) {
+        //ERROR(sp, E0000, "#[derive()] requires a list of known traits to derive");
+        return ;
+    }
+
+    DEBUG("path = " << path);
+
+    auto type = make_type(sp, path, item.params());
+
+    DeriveOpts opts = {
+        crate.m_ext_cratename_core
+        };
+
+    bool    fail = false;
+    ::std::vector<AST::AttributeName>   missing_handlers;
+    for( const auto& trait_path : derive_items )
+    {
+        DEBUG("- " << trait_path);
+
+        if( trait_path.elems.size() == 1 )
+        {
+            auto dp = find_impl(trait_path.elems[0]);
+            if( dp ) {
+                mod.add_item(sp, false, "", dp->handle_item(sp, opts, item.params(), type, item), {} );
+                continue ;
+            }
+        }
+
+        std::vector<RcString>   mac_path = find_macro(sp, crate, mod, trait_path);
 
         bool found = false;
         if( !mac_path.empty() )
@@ -2247,6 +2294,7 @@ static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mo
             auto lex = ProcMacro_Invoke(sp, crate, mac_path, attrs, path.nodes.back().c_str(), item);
             if( lex )
             {
+                lex->parse_state().module = &mod;
                 Parse_ModRoot_Items(*lex, mod);
                 found = true;
             }
@@ -2257,8 +2305,8 @@ static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mo
         if( found )
             continue ;
 
-        DEBUG("> No handler for " << trait.name());
-        missing_handlers.push_back( trait.name() );
+        DEBUG("> No handler for " << trait_path);
+        missing_handlers.push_back( trait_path );
         fail = true;
     }
 

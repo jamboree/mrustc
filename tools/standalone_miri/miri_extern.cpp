@@ -14,6 +14,7 @@
 #include <iomanip>
 #include "debug.hpp"
 #include "miri.hpp"
+#include <target_version.hpp>
 // VVV FFI
 #include <cstring>  // memrchr
 #include <sys/stat.h>
@@ -76,8 +77,11 @@ bool InterpreterThread::call_extern(Value& rv, const ::std::string& link_name, c
         auto size = args.at(0).read_usize(0);
         auto align = args.at(1).read_usize(0);
         LOG_DEBUG(link_name << "(size=" << size << ", align=" << align << "): name=" << alloc_name);
+        LOG_ASSERT( (align & (align-1)) == 0, "Allocation alignment isn't a power of two - " << align );
+        LOG_ASSERT( (size & (align-1)) == 0, "Allocation size isn't a multiple of alignment - s=" << size << ", a=" << align );
 
         // TODO: Use the alignment when making an allocation?
+        // - Could offset the returned pointer by the alignment (to catch misalign errors?)
         auto alloc = Allocation::new_alloc(size, ::std::move(alloc_name));
         LOG_TRACE("- alloc=" << alloc << " (" << alloc->size() << " bytes)");
         auto rty = ::HIR::TypeRef(RawType::Unit).wrap( TypeWrapper::Ty::Pointer, 0 );
@@ -87,44 +91,49 @@ bool InterpreterThread::call_extern(Value& rv, const ::std::string& link_name, c
             alloc->mark_bytes_valid(0, size);
         }
 
-        rv = Value::new_pointer(rty, Allocation::PTR_BASE, RelocationPtr::new_alloc(::std::move(alloc)));
+        rv = Value::new_pointer_ofs(rty, 0, RelocationPtr::new_alloc(::std::move(alloc)));
     }
     else if( link_name == "__rust_reallocate" || link_name == "__rust_realloc" )
     {
-        auto alloc_ptr = args.at(0).get_relocation(0);
-        auto ptr_ofs = args.at(0).read_usize(0);
         auto oldsize = args.at(1).read_usize(0);
-        // NOTE: The ordering here depends on the rust version (1.19 has: old, new, align - 1.29 has: old, align, new)
-        auto align = args.at(true /*1.29*/ ? 2 : 3).read_usize(0);
-        auto newsize = args.at(true /*1.29*/ ? 3 : 2).read_usize(0);
-        LOG_DEBUG("__rust_reallocate(ptr=" << alloc_ptr << ", oldsize=" << oldsize << ", newsize=" << newsize << ", align=" << align << ")");
-        LOG_ASSERT(ptr_ofs == Allocation::PTR_BASE, "__rust_reallocate with offset pointer");
+        auto ptr = args.at(0).read_pointer_valref_mut(0, oldsize);
 
-        LOG_ASSERT(alloc_ptr, "__rust_reallocate with no backing allocation attached to pointer");
-        LOG_ASSERT(alloc_ptr.is_alloc(), "__rust_reallocate with no backing allocation attached to pointer");
-        auto& alloc = alloc_ptr.alloc();
+        // NOTE: The ordering here depends on the rust version (1.19 has: old, new, align - 1.29 has: old, align, new)
+        auto align = args.at(TARGETVER_LEAST_1_29 ? 2 : 3).read_usize(0);
+        auto newsize = args.at(TARGETVER_LEAST_1_29 ? 3 : 2).read_usize(0);
+        LOG_DEBUG("__rust_reallocate(ptr=" << ptr.m_alloc << ", oldsize=" << oldsize << ", newsize=" << newsize << ", align=" << align << ")");
+        LOG_ASSERT(ptr.m_offset == 0, "__rust_reallocate with offset pointer");
+
+        LOG_ASSERT( (align & (align-1)) == 0, "Allocation alignment isn't a power of two - " << align );
+        LOG_ASSERT( (newsize & (align-1)) == 0, "Allocation size isn't a multiple of alignment - s=" << newsize << ", a=" << align );
+
+        LOG_ASSERT(ptr.m_alloc, "__rust_reallocate with no backing allocation attached to pointer");
+        LOG_ASSERT(ptr.m_alloc.is_alloc(), "__rust_reallocate with no backing allocation attached to pointer");
+        auto& alloc = ptr.m_alloc.alloc();
         // TODO: Check old size and alignment against allocation.
-        alloc.resize(newsize);
+        LOG_ASSERT(oldsize == alloc.size(), "__rust_reallocate with different size");
+
         // TODO: Should this instead make a new allocation to catch use-after-free?
+        alloc.resize(newsize);
+
         rv = ::std::move(args.at(0));
     }
     else if( link_name == "__rust_deallocate" || link_name == "__rust_dealloc" )
     {
-        auto alloc_ptr = args.at(0).get_relocation(0);
-        auto ptr_ofs = args.at(0).read_usize(0);
-        LOG_ASSERT(ptr_ofs == Allocation::PTR_BASE, "__rust_deallocate with offset pointer");
-        LOG_DEBUG("__rust_deallocate(ptr=" << alloc_ptr << ")");
+        auto ptr = args.at(0).read_pointer_valref_mut(0, 0);
+        LOG_ASSERT(ptr.m_offset == 0, "__rust_deallocate with offset pointer");
+        LOG_DEBUG("__rust_deallocate(ptr=" << ptr.m_alloc << ")");
 
-        LOG_ASSERT(alloc_ptr, "__rust_deallocate with no backing allocation attached to pointer");
-        LOG_ASSERT(alloc_ptr.is_alloc(), "__rust_deallocate with no backing allocation attached to pointer");
-        auto& alloc = alloc_ptr.alloc();
+        LOG_ASSERT(ptr.m_alloc, "__rust_deallocate with no backing allocation attached to pointer");
+        LOG_ASSERT(ptr.m_alloc.is_alloc(), "__rust_deallocate with no backing allocation attached to pointer");
+        auto& alloc = ptr.m_alloc.alloc();
         alloc.mark_as_freed();
         // Just let it drop.
         rv = Value();
     }
     else if( link_name == "__rust_maybe_catch_panic" )
     {
-        auto fcn_path = args.at(0).get_relocation(0).fcn();
+        auto fcn_path = args.at(0).read_pointer_fcn(0);
         auto arg = args.at(1);
         auto data_ptr = args.at(2).read_pointer_valref_mut(0, POINTER_SIZE);
         auto vtable_ptr = args.at(3).read_pointer_valref_mut(0, POINTER_SIZE);
@@ -187,10 +196,10 @@ bool InterpreterThread::call_extern(Value& rv, const ::std::string& link_name, c
         const void* arg0 = (tgt_alloc ? tgt_alloc.alloc().data_ptr() : nullptr);
         //extern void* GetModuleHandleW(const void* s);
         if(arg0) {
-            LOG_DEBUG("GetModuleHandleW(" << tgt_alloc.alloc() << ")");
+            LOG_DEBUG("FFI GetModuleHandleW(" << tgt_alloc.alloc() << ")");
         }
         else {
-            LOG_DEBUG("GetModuleHandleW(NULL)");
+            LOG_DEBUG("FFI GetModuleHandleW(NULL)");
         }
 
         auto ret = GetModuleHandleW(static_cast<LPCWSTR>(arg0));
@@ -221,6 +230,10 @@ bool InterpreterThread::call_extern(Value& rv, const ::std::string& link_name, c
 
         if( ret )
         {
+            char modulename[1024] = {0};
+            GetModuleFileNameA(static_cast<HMODULE>(handle), modulename, sizeof(modulename));
+            auto* last_slash = std::strrchr(modulename, '\\');
+            std::string name = std::string("#FFI{") + (last_slash+1) + "}" + static_cast<const char*>(symname);
             // TODO: Get the functon name (and source library) and store in the result
             // - Maybe return a FFI function pointer (::"#FFI"::DllName+ProcName)
             rv = Value::new_ffiptr(FFIPointer::new_void("GetProcAddress", ret));
@@ -515,8 +528,7 @@ bool InterpreterThread::call_extern(Value& rv, const ::std::string& link_name, c
     {
         auto thread_handle_out = args.at(0).read_pointer_valref_mut(0, sizeof(pthread_t));
         auto attrs = args.at(1).read_pointer_const(0, sizeof(pthread_attr_t));
-        auto fcn_path = args.at(2).get_relocation(0).fcn();
-        LOG_ASSERT(args.at(2).read_usize(0) == Allocation::PTR_BASE, "");
+        auto fcn_path = args.at(2).read_pointer_fcn(0);
         auto arg = args.at(3);
         LOG_NOTICE("TODO: pthread_create(" << thread_handle_out << ", " << attrs << ", " << fcn_path << ", " << arg << ")");
         // TODO: Create a new interpreter context with this thread, use co-operative scheduling

@@ -20,13 +20,13 @@ struct LowerHIR_ExprNode_Visitor:
     // - They have different HIR node types
     bool    m_has_yield = false;
 
-    ::std::unique_ptr< ::HIR::ExprNode> lower(const std::unique_ptr<::AST::ExprNode>& ep) {
+    ::std::unique_ptr< ::HIR::ExprNode> lower(::AST::ExprNodeP& ep) {
         assert(ep);
         ep->visit(*this);
         ASSERT_BUG(ep->span(), m_rv, typeid_name(*ep) << " - Yielded a nullptr HIR node");
         return std::move(m_rv);
     }
-    ::std::unique_ptr< ::HIR::ExprNode> lower_opt(const std::unique_ptr<::AST::ExprNode>& ep) {
+    ::std::unique_ptr< ::HIR::ExprNode> lower_opt(::AST::ExprNodeP& ep) {
         if( ep ) {
             return lower(ep);
         }
@@ -38,7 +38,7 @@ struct LowerHIR_ExprNode_Visitor:
 
     virtual void visit(::AST::ExprNode_Block& v) override {
         auto rv = new ::HIR::ExprNode_Block(v.span());
-        for(const auto& n : v.m_nodes)
+        for(auto& n : v.m_nodes)
         {
             ASSERT_BUG(v.span(), n, "NULL node encountered in block");
             rv->m_nodes.push_back( lower( n ) );
@@ -88,6 +88,36 @@ struct LowerHIR_ExprNode_Visitor:
             inputs.push_back( ::HIR::ExprNode_Asm::ValRef { vr.name, lower(vr.value) } );
 
         m_rv.reset( new ::HIR::ExprNode_Asm( v.span(), v.m_text, mv$(outputs), mv$(inputs), v.m_clobbers, v.m_flags ) );
+    }
+    virtual void visit(::AST::ExprNode_Asm2& v) override {
+        std::vector< ::HIR::ExprNode_Asm2::Param>  params;
+        for(auto& p : v.m_params)
+        {
+            TU_MATCH_HDRA((p), {)
+            TU_ARMA(Const, e) {
+                params.push_back( lower(e) );
+                }
+            TU_ARMA(Sym, e) {
+                params.push_back( LowerHIR_Path(v.span(), e, FromAST_PathClass::Value) );
+                }
+            TU_ARMA(RegSingle, e) {
+                params.push_back(::HIR::ExprNode_Asm2::Param::make_RegSingle({
+                    e.dir,
+                    e.spec.clone(),
+                    lower(e.val)
+                    }));
+                }
+            TU_ARMA(Reg, e) {
+                params.push_back(::HIR::ExprNode_Asm2::Param::make_Reg({
+                    e.dir,
+                    e.spec.clone(),
+                    lower(e.val_in),
+                    e.val_out ? lower(e.val_out) : nullptr
+                    }));
+                }
+            }
+        }
+        m_rv.reset( new ::HIR::ExprNode_Asm2( v.span(), v.m_options, v.m_lines, mv$(params) ) );
     }
     virtual void visit(::AST::ExprNode_Flow& v) override {
         switch( v.m_type )
@@ -210,8 +240,14 @@ struct LowerHIR_ExprNode_Visitor:
         case ::AST::ExprNode_UniOp::REF:
             m_rv.reset(new ::HIR::ExprNode_Borrow(v.span(), ::HIR::BorrowType::Shared, lower( v.m_value ) ));
             break;
+        case ::AST::ExprNode_UniOp::RawBorrow:
+            m_rv.reset(new ::HIR::ExprNode_RawBorrow(v.span(), ::HIR::BorrowType::Shared, lower( v.m_value ) ));
+            break;
         case ::AST::ExprNode_UniOp::REFMUT:
             m_rv.reset(new ::HIR::ExprNode_Borrow(v.span(), ::HIR::BorrowType::Unique, lower( v.m_value ) ));
+            break;
+        case ::AST::ExprNode_UniOp::RawBorrowMut:
+            m_rv.reset(new ::HIR::ExprNode_RawBorrow(v.span(), ::HIR::BorrowType::Unique, lower( v.m_value ) ));
             break;
 
         case ::AST::ExprNode_UniOp::INVERT: op = ::HIR::ExprNode_UniOp::Op::Invert; if(0)
@@ -240,7 +276,7 @@ struct LowerHIR_ExprNode_Visitor:
 
     virtual void visit(::AST::ExprNode_CallPath& v) override {
         ::std::vector< ::HIR::ExprNodeP> args;
-        for(const auto& arg : v.m_args)
+        for(auto& arg : v.m_args)
             args.push_back( lower(arg) );
 
         if(const auto* e = v.m_path.m_class.opt_Local()) {
@@ -283,38 +319,19 @@ struct LowerHIR_ExprNode_Visitor:
     }
     virtual void visit(::AST::ExprNode_CallMethod& v) override {
         ::std::vector< ::HIR::ExprNodeP> args;
-        for(const auto& arg : v.m_args)
+        for(auto& arg : v.m_args)
             args.push_back( lower(arg) );
-
-        // TODO: Should this be abstracted?
-        ::HIR::PathParams   params;
-        for(const auto& param : v.m_method.args().m_entries)
-        {
-            TU_MATCH_HDRA( (param), { )
-            TU_ARMA(Null, _) {}
-            TU_ARMA(Lifetime, _) {}
-            TU_ARMA(Type, ty) {
-                params.m_types.push_back( LowerHIR_Type(ty) );
-                }
-            TU_ARMA(AssociatedTyEqual, _) {
-                ERROR(v.span(), E0000, "Unexpected associated type equality");
-                }
-            TU_ARMA(AssociatedTyBound, _) {
-                ERROR(v.span(), E0000, "Unexpected associated type bound");
-                }
-            }
-        }
 
         m_rv.reset( new ::HIR::ExprNode_CallMethod( v.span(),
             lower(v.m_val),
             v.m_method.name(),
-            mv$(params),
+            LowerHIR_PathParams(v.span(), v.m_method.args(), /*allow_assoc=*/false),
             mv$(args)
             ) );
     }
     virtual void visit(::AST::ExprNode_CallObject& v) override {
         ::std::vector< ::HIR::ExprNodeP> args;
-        for(const auto& arg : v.m_args)
+        for(auto& arg : v.m_args)
             args.push_back( lower(arg) );
 
         m_rv.reset( new ::HIR::ExprNode_CallValue( v.span(),
@@ -426,7 +443,7 @@ struct LowerHIR_ExprNode_Visitor:
     virtual void visit(::AST::ExprNode_Match& v) override {
         ::std::vector< ::HIR::ExprNode_Match::Arm>  arms;
 
-        for(const auto& arm : v.m_arms)
+        for(auto& arm : v.m_arms)
         {
             ::HIR::ExprNode_Match::Arm  new_arm {
                 {},
@@ -598,7 +615,7 @@ struct LowerHIR_ExprNode_Visitor:
         }
 
         ::HIR::ExprNode_StructLiteral::t_values values;
-        for(const auto& val : v.m_values)
+        for(auto& val : v.m_values)
             values.push_back( ::std::make_pair(val.name, lower(val.value)) );
         auto ty = LowerHIR_Type( ::TypeRef(v.span(), v.m_path) );
         if( v.m_path.m_bindings.type.binding.is_EnumVar() )
@@ -628,15 +645,15 @@ struct LowerHIR_ExprNode_Visitor:
         else
         {
             ::std::vector< ::HIR::ExprNodeP>    vals;
-            for(const auto& val : v.m_values)
+            for(auto& val : v.m_values)
                 vals.push_back( lower(val) );
             m_rv.reset( new ::HIR::ExprNode_ArrayList( v.span(), mv$(vals) ) );
         }
     }
     virtual void visit(::AST::ExprNode_Tuple& v) override {
         ::std::vector< ::HIR::ExprNodeP>    vals;
-        for(const auto& val : v.m_values)
-            vals.push_back( lower(val ) );
+        for(auto& val : v.m_values)
+            vals.push_back( lower(val) );
         m_rv.reset( new ::HIR::ExprNode_Tuple( v.span(), mv$(vals) ) );
     }
     virtual void visit(::AST::ExprNode_NamedValue& v) override {

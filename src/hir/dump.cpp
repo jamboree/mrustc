@@ -35,6 +35,14 @@ namespace {
                 inc_indent();
             }
 
+            // TODO: Include trait list
+            if(true)
+            {
+                for(const auto& t : mod.m_traits)
+                {
+                    m_os << indent() << "use " << t << ";\n";
+                }
+            }
             // TODO: Print publicitiy.
             ::HIR::Visitor::visit_module(p, mod);
 
@@ -285,7 +293,7 @@ namespace {
         void visit_constant(::HIR::ItemPath p, ::HIR::Constant& item) override
         {
             m_os << indent() << "const " << p.get_name() << ": " << item.m_type << " = " << item.m_value_res;
-            if( item.m_value )
+            if( item.m_value && item.m_value_state != HIR::Constant::ValueState::Known )
             {
                 m_os << " /*= ";
                 item.m_value->visit(*this);
@@ -349,6 +357,11 @@ namespace {
         }
 
         void visit(::HIR::ExprNode_Asm& node) override
+        {
+            m_os << "llvm_asm!(";
+            m_os << ")";
+        }
+        void visit(::HIR::ExprNode_Asm2& node) override
         {
             m_os << "asm!(";
             m_os << ")";
@@ -481,6 +494,21 @@ namespace {
         void visit(::HIR::ExprNode_Borrow& node) override
         {
             m_os << "&";
+            switch(node.m_type)
+            {
+            case ::HIR::BorrowType::Shared: break;
+            case ::HIR::BorrowType::Unique: m_os << "mut "; break;
+            case ::HIR::BorrowType::Owned : m_os << "move "; break;
+            }
+
+            bool skip_parens = this->node_is_leaf(*node.m_value) || NODE_IS(node.m_value, _Deref);
+            if( !skip_parens )  m_os << "(";
+            this->visit_node_ptr(node.m_value);
+            if( !skip_parens )  m_os << ")";
+        }
+        void visit(::HIR::ExprNode_RawBorrow& node) override
+        {
+            m_os << "&raw ";
             switch(node.m_type)
             {
             case ::HIR::BorrowType::Shared: break;
@@ -710,7 +738,7 @@ namespace {
         {
             m_os << "[";
             this->visit_node_ptr(node.m_val);
-            m_os << "; " << node.m_size_val;
+            m_os << "; " << node.m_size;
             m_os << "]";
         }
         void visit(::HIR::ExprNode_Closure& node) override

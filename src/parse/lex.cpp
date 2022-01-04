@@ -18,33 +18,38 @@
 //#define TRACE_CHARS
 //#define TRACE_RAW_TOKENS
 
-Lexer::Lexer(const ::std::string& filename, ParseState ps):
+Lexer::Lexer(const ::std::string& filename, AST::Edition edition, ParseState ps):
     TokenStream(ps),
     m_path(filename.c_str()),
     m_line(1),
     m_line_ofs(0),
-    m_istream(filename.c_str()),
+    m_istream_fp(filename != "-" ? new std::ifstream(filename.c_str()) : nullptr),
+    m_istream(filename != "-" ? *m_istream_fp : std::cin),
     m_last_char_valid(false),
+    m_edition(edition),
     m_hygiene( Ident::Hygiene::new_scope() )
 {
-    if( !m_istream.is_open() )
+    if( m_istream_fp )
     {
-        throw ::std::runtime_error("Unable to open file '" + filename + "'");
-    }
-    // Consume the BOM
-    if( this->getc_byte() == '\xef' )
-    {
-        if( this->getc_byte() != '\xbb' ) {
-            throw ::std::runtime_error("Incomplete BOM - missing \\xBB in second position");
+        if( !m_istream_fp->is_open() )
+        {
+            throw ::std::runtime_error("Unable to open file '" + filename + "'");
         }
-        if( this->getc_byte() != '\xbf' ) {
-            throw ::std::runtime_error("Incomplete BOM - missing \\xBF in second position");
+        // Consume the BOM
+        if( this->getc_byte() == '\xef' )
+        {
+            if( this->getc_byte() != '\xbb' ) {
+                throw ::std::runtime_error("Incomplete BOM - missing \\xBB in second position");
+            }
+            if( this->getc_byte() != '\xbf' ) {
+                throw ::std::runtime_error("Incomplete BOM - missing \\xBF in second position");
+            }
+            m_line_ofs = 0;
         }
-        m_line_ofs = 0;
-    }
-    else
-    {
-        m_istream.unget();
+        else
+        {
+            m_istream.unget();
+        }
     }
 }
 
@@ -498,6 +503,13 @@ Token Lexer::getTokenInt()
 
                     this->ungetc();
                     double fval = this->parseFloat(val);
+                    if( fval != fval )
+                    {
+                        assert(!this->m_next_tokens.empty());
+                        auto t = std::move( this->m_next_tokens.back() );
+                        this->m_next_tokens.pop_back();
+                        return t;
+                    }
                     if( issym(ch = this->getc()) )
                     {
                         ::std::string   suffix;
@@ -518,7 +530,7 @@ Token Lexer::getTokenInt()
                     {
                         this->ungetc();
                     }
-                    return Token( fval, num_type);
+                    return Token(fval, num_type);
 
                 }
                 else if( issym(ch)) {
@@ -884,13 +896,13 @@ Token Lexer::getTokenInt_Identifier(Codepoint leader, Codepoint leader2, bool pa
     this->ungetc();
     if(parse_reserved_word)
     {
-        auto v = Lex_FindReservedWord(str, this->parse_state().get_edition());
+        auto v = Lex_FindReservedWord(str, this->m_edition);
         if( v != TOK_NULL)
         {
             return Token(v);
         }
     }
-    return Token(TOK_IDENT, Ident(this->get_hygiene(), RcString::new_interned(str)));
+    return Token(TOK_IDENT, Ident(this->realGetHygiene(), RcString::new_interned(str)));
 }
 
 // Takes the VERY lazy way of reading the float into a string then passing to strtod
@@ -907,6 +919,24 @@ double Lexer::parseFloat(uint64_t whole)
     {
         PUTC(ch);
         ch = this->getc_num();
+    }
+    // If the current char is a `.`
+    if( ch == '.' )
+    {
+        buf[ofs] = '\0';
+        assert( buf[ofs-1] != '.' );    // Shouldn't be possible (as that would have been handled by the caller as `<int> '..'`
+        DEBUG("Detected double tuple indexing (trailing `.` after a float - " << buf << ")");
+        // x.y. -> This should be two integers.
+        // - Parse into `<int> '.' <int>` (ungetting the final `.`)
+        auto cit = std::find(buf, buf+sizeof(buf), '.');
+        *cit = '\0';
+        // - Push these in reverse order (as they're popped off the back)
+        this->ungetc();
+        m_next_tokens.push_back(Token(static_cast<uint64_t>(std::strtoull(cit+1, nullptr, 10)), CORETYPE_ANY));
+        m_next_tokens.push_back(TOK_DOT);
+        m_next_tokens.push_back(Token(static_cast<uint64_t>(std::strtoull(buf  , nullptr, 10)), CORETYPE_ANY));
+
+        return std::numeric_limits<double>::quiet_NaN();
     }
     if( ch == 'e' || ch == 'E' )
     {
@@ -1232,10 +1262,12 @@ Token Lex_FindReservedWord(const ::std::string& s, AST::Edition edition)
         RWORDS = RWORDS_2015;
         break;
     case AST::Edition::Rust2018:
+    case AST::Edition::Rust2021:
         len = LEN(RWORDS_2018);
         RWORDS = RWORDS_2018;
         break;
     }
+    assert(len > 0);
     for(size_t i = 0; i < len; i++)
     {
         const auto& e = RWORDS[i];

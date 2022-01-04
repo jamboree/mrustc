@@ -196,8 +196,10 @@ namespace {
     ::std::tuple< ::std::vector<FmtFrag>, ::std::string> parse_format_string(
         const Span& sp,
         const ::std::string& format_string,
-        const ::std::map<RcString,unsigned int>& named,
-        unsigned int n_free
+        ::std::map<RcString,unsigned int>& named,
+        unsigned int n_free,
+        std::vector<TokenTree>& named_args,
+        const Ident::Hygiene& hygiene
         )
     {
         //unsigned int n_named = named.size();
@@ -266,8 +268,12 @@ namespace {
                         }
                         auto ident = RcString(start, s - start);
                         auto it = named.find(ident);
-                        if( it == named.end() )
-                            ERROR(sp, E0000, "Named argument '"<<ident<<"' not found");
+                        if( it == named.end() ) {
+                            // Add an implicit named argument
+                            it = named.insert(std::make_pair(ident, static_cast<unsigned>(named_args.size()))).first;
+                            // TODO: Create a token with span information pointing to this location in the string.
+                            named_args.push_back(Token(TOK_IDENT, Ident(hygiene, ident)));
+                        }
                         index = n_free + it->second;
                     }
                 }
@@ -537,6 +543,7 @@ namespace {
         Token   tok;
 
         auto format_string_node = Parse_ExprVal(lex);
+        auto h = lex.get_hygiene();
         ASSERT_BUG(sp, format_string_node, "No expression returned");
         Expand_BareExpr(crate, lex.parse_state().get_current_mod(), format_string_node);
 
@@ -560,10 +567,11 @@ namespace {
             }
 
             // - Named parameters
-            if( lex.lookahead(0) == TOK_IDENT && lex.lookahead(1) == TOK_EQUAL )
+            if( (lex.lookahead(0) == TOK_IDENT || Token::type_is_rword(lex.lookahead(0))) && lex.lookahead(1) == TOK_EQUAL )
             {
-                GET_CHECK_TOK(tok, lex, TOK_IDENT);
-                auto name = tok.ident().name;
+                GET_TOK(tok, lex);
+                auto name = tok.type() == TOK_IDENT ? tok.ident().name : RcString::new_interned(tok.to_str());
+                DEBUG("Named `" << name << "`");
 
                 GET_CHECK_TOK(tok, lex, TOK_EQUAL);
 
@@ -578,6 +586,7 @@ namespace {
             // - Free parameters
             else
             {
+                DEBUG("Free");
                 auto expr_tt = TokenTree(Token( InterpolatedFragment(InterpolatedFragment::EXPR, Parse_Expr0(lex).release()) ));
                 free_args.push_back( mv$(expr_tt) );
             }
@@ -587,7 +596,7 @@ namespace {
         // - Parse the format string
         ::std::vector< FmtFrag> fragments;
         ::std::string   tail;
-        ::std::tie( fragments, tail ) = parse_format_string(format_string_sp, format_string,  named_args_index, free_args.size());
+        ::std::tie( fragments, tail ) = parse_format_string(format_string_sp, format_string,  named_args_index, free_args.size(), named_args, h);
         if( add_newline )
         {
             tail += "\n";
@@ -736,7 +745,12 @@ namespace {
                     toks.push_back( TokenTree(TOK_BRACE_OPEN) );
 
                     push_toks(toks, ident("position"), TOK_COLON );
-                    push_path(toks, crate, {"fmt", "rt", "v1", "Position", "Next"});
+                    if(TARGETVER_MOST_1_39) {
+                        push_path(toks, crate, {"fmt", "rt", "v1", "Position", "Next"});
+                    }
+                    else {
+                        push_toks(toks, Token(static_cast<uint64_t>(&frag - fragments.data()), CORETYPE_UINT));
+                    }
                     push_toks(toks, TOK_COMMA);
 
                     push_toks(toks, ident("format"), TOK_COLON );
@@ -825,7 +839,7 @@ namespace {
         toks.push_back( TokenTree(TOK_BRACE_CLOSE) );
         toks.push_back( TokenTree(TOK_BRACE_CLOSE) );
 
-        return box$( TTStreamO(sp, ParseState(crate.m_edition), TokenTree(Ident::Hygiene::new_scope(), mv$(toks))) );
+        return box$( TTStreamO(sp, ParseState(), TokenTree(lex.get_edition(), Ident::Hygiene::new_scope(), mv$(toks))) );
     }
 }
 
@@ -836,7 +850,7 @@ class CFormatArgsExpander:
     {
         Token   tok;
 
-        auto lex = TTStream(sp, ParseState(crate.m_edition), tt);
+        auto lex = TTStream(sp, ParseState(), tt);
         lex.parse_state().module = &mod;
 
         return expand_format_args(sp, crate, lex, /*add_newline=*/false);
@@ -850,7 +864,7 @@ class CFormatArgsNlExpander:
     {
         Token   tok;
 
-        auto lex = TTStream(sp, ParseState(crate.m_edition), tt);
+        auto lex = TTStream(sp, ParseState(), tt);
         lex.parse_state().module = &mod;
 
         return expand_format_args(sp, crate, lex, /*add_newline=*/true);

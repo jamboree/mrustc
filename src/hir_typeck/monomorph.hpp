@@ -16,13 +16,15 @@ class Monomorphiser
 {
 public:
     virtual ::HIR::TypeRef get_type(const Span& sp, const ::HIR::GenericRef& g) const = 0;
-    virtual ::HIR::Literal get_value(const Span& sp, const ::HIR::GenericRef& g) const = 0;
+    virtual ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& g) const = 0;
 
-    ::HIR::TypeRef monomorph_type(const Span& sp, const ::HIR::TypeRef& ty, bool allow_infer=true) const;
+    virtual ::HIR::TypeRef monomorph_type(const Span& sp, const ::HIR::TypeRef& ty, bool allow_infer=true) const;
     ::HIR::Path monomorph_path(const Span& sp, const ::HIR::Path& tpl, bool allow_infer=true) const;
     ::HIR::TraitPath monomorph_traitpath(const Span& sp, const ::HIR::TraitPath& tpl, bool allow_infer) const;
     ::HIR::PathParams monomorph_path_params(const Span& sp, const ::HIR::PathParams& tpl, bool allow_infer) const;
     ::HIR::GenericPath monomorph_genericpath(const Span& sp, const ::HIR::GenericPath& tpl, bool allow_infer) const;
+
+    ::HIR::ArraySize monomorph_arraysize(const Span& sp, const ::HIR::ArraySize& tpl) const;
 
     const ::HIR::TypeRef& maybe_monomorph_type(const Span& sp, ::HIR::TypeRef& tmp, const ::HIR::TypeRef& ty, bool allow_infer=true) const {
         if( monomorphise_type_needed(ty) ) {
@@ -43,7 +45,7 @@ public:
     virtual const ::HIR::PathParams* get_method_params() const = 0;
 
     ::HIR::TypeRef get_type(const Span& sp, const ::HIR::GenericRef& ty) const override;
-    ::HIR::Literal get_value(const Span& sp, const ::HIR::GenericRef& val) const override;
+    ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& val) const override;
 };
 class MonomorphiserNop:
     public Monomorphiser
@@ -52,8 +54,8 @@ public:
     ::HIR::TypeRef get_type(const Span& sp, const ::HIR::GenericRef& ty) const override {
         return HIR::TypeRef(ty);
     }
-    ::HIR::Literal get_value(const Span& sp, const ::HIR::GenericRef& val) const override {
-        return HIR::Literal(val);
+    ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& val) const override {
+        return HIR::ConstGeneric(val);
     }
 };
 

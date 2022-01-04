@@ -4,37 +4,83 @@
  *
  * trans/mangling_v2.cpp
  * - Name mangling (encoding of rust paths into symbols)
+ * 
+ * Ensures that symbols contain only alpha-numerics and `_`
+ * NOTE: `$` is used ONLY for shortening excessively long symbols
  */
 #include <debug.hpp>
 #include <string_view.hpp>
 #include <hir/hir.hpp>  // ABI_RUST
 #include <hir/type.hpp>
 #include <cctype>
+#include <algorithm>	// std::find
+#include <cmath>	// ceil/log10
 
 class Mangler
 {
     ::std::ostream& m_os;
+    std::vector<RcString>    m_name_cache;
 public:
     Mangler(::std::ostream& os):
         m_os(os)
     {
     }
 
-    // Item names:
-    // - These can have a single '#' in them (either leading or in the middle)
-    // TODO: Some other invalid characters can appear:
-    // - '-' (crate names)
+    /// Formats an integer in a decodable format (lower case until the final digit)
+    // Used to encode values that might be have trailing digits
+    void fmt_base26_int(unsigned val)
+    {
+        // Lower-case: 
+        while(val >= 26) {
+            m_os << char('a' + (val%26));
+            val /= 26;
+        }
+        assert(val < 26);
+        m_os << char('A' + val);
+    }
+
+    // Reference-counted item names
+    // - These can be repeated quite often, so support back-references
+    //   > Back-references are emitted as "`_` <base26>"
+    // - Otherwise, emitted as a raw string (see below)
     void fmt_name(const RcString& s)
     {
+        // Support back-references to names (if shorter than the literal name)
+        auto it = std::find(m_name_cache.begin(), m_name_cache.end(), s);
+        if(it != m_name_cache.end())
+        {
+            auto idx = it - m_name_cache.begin();
+            // Only emit this way if shorter than the formatted name would be.
+            auto len = 1 + static_cast<unsigned>(std::ceil(std::log10(idx+1) / std::log10(26)));
+            if(len < s.size())
+            {
+                m_os << "_"; fmt_base26_int(idx);
+                return ;
+            }
+        }
+        else
+        {
+            m_name_cache.push_back(s);
+        }
+
         this->fmt_name(s.c_str());
     }
+    // Item names:
+    // - These can have a single '#' in them (either leading or in the middle)
+    // - '-' (crate names)
+    // Encoding is either:
+    // - "<len:int> <raw_data>" (fully valid identifier)
+    // - "<ofs:base26> <len:int> <raw_data1> <raw_data2>" (`#` or `-` present)
+    // - "<len:base26> `_` <raw_data2>" (`#` or `-` at the start)
     void fmt_name(const char* const s)
     {
         size_t size = strlen(s);
         const char* hash_pos = nullptr;
-        // - Search the string for the '#' character
+        // - Search the string for the '#' or '-' character
         for(const auto* p = s; *p; p++)
         {
+            // If looking at the first character, ensure that it's not a digit
+            // - Also, `#<digit>` isn't valid (as it'd also badly encode)
             if( p == s ) {
                 ASSERT_BUG(Span(), !isdigit(*p), "Leading digit not valid in '" << s << "'");
             }
@@ -53,18 +99,25 @@ public:
             }
         }
 
-        // If there's a hash, then prefix with a letter indicating its location?
-        // - Using a 3 character overhead currently (but a letter could work really well)
+        // If there's a hash, then encode such that it's removed
         if( hash_pos != nullptr )
         {
             auto pre_hash_len = static_cast<int>(hash_pos - s);
-#if 0
-            assert(pre_hash_len < 26);
-            // <posletter> <full_len> <body1> <body2>
-            m_os << 'a' + pre_hash_len;
-            m_os << size - 1;
-            m_os << ::stdx::string_view(s, s + pre_hash_len);
-            m_os << hash_pos + 1;;
+#if 1
+            if( hash_pos == s && isdigit(hash_pos[1]) ) {
+                // <len:base26> '_' <body2>
+                // An encoding that allows this pattern
+                fmt_base26_int(size-1);
+                m_os << '_';
+                m_os << hash_pos + 1;
+            }
+            else {
+                // <pos:base26> <len:int> <body1> <body2>
+                fmt_base26_int(pre_hash_len);
+                m_os << size - 1;
+                m_os << ::stdx::string_view(s, s + pre_hash_len);
+                m_os << hash_pos + 1;
+            }
 #else
             // If the suffix is all digits, then print `H` and the literal contents
             if( false && std::isdigit(hash_pos[1]) )
@@ -110,10 +163,31 @@ public:
     {
         // Type Parameter count
         m_os << pp.m_types.size();
+        if(pp.m_values.size() > 0) {
+            m_os << "v";
+            m_os << pp.m_values.size();
+        }
         m_os << "g";
         for(const auto& ty : pp.m_types)
         {
             fmt_type(ty);
+        }
+        for(const auto& v : pp.m_values)
+        {
+            const auto& ev = *v.as_Evaluated();
+            m_os << "V";
+            m_os << ev.bytes.size();
+            m_os << "_";
+            // TODO: Base64 data? (`_` and `$` as the other two?)
+            for(size_t i = 0; i < ev.bytes.size(); i ++) {
+                m_os << "0123456789abcdef"[ ev.bytes[i] >> 4 ];
+                m_os << "0123456789abcdef"[ ev.bytes[i] & 0xF ];
+            }
+            if( ev.relocations.size() > 0 )
+            {
+                m_os << "_" << ev.relocations.size() << "R";
+                TODO(Span(), "Mangle relocated values");
+            }
         }
     }
     // GenericPath : <SimplePath> <PathParams>
@@ -161,7 +235,7 @@ public:
     // - TraitObject: 'D' <data:GenericPath> <nmarker> [markers: <GenericPath> ...] <naty> [<TypeRef> ...]    TODO: Does this need to include the ATY name?
     // - Borrow: 'B' ('s'|'u'|'o') <TypeRef>
     // - RawPointer: 'P' ('s'|'u'|'o') <TypeRef>
-    // - Function: 'F' <abi:RcString> <nargs> [args: <TypeRef> ...] <ret:TypeRef>
+    // - Function: 'F' (|'u') (| 'e' <abi:RcString>) <nargs> [args: <TypeRef> ...] <ret:TypeRef>
     // - Primitives::
     //   - u8  : 'C' 'a'
     //   - i8  : 'C' 'b'

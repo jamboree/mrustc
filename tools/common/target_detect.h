@@ -26,8 +26,19 @@
 #  define DEFAULT_TARGET_NAME "i586-linux-gnu"
 # elif defined(__m68k__)
 #  define DEFAULT_TARGET_NAME "m68k-linux-gnu"
+# elif defined(__powerpc64__) && defined(__BIG_ENDIAN__)
+#  define DEFAULT_TARGET_NAME "powerpc64-unknown-linux-gnu"
+# elif defined(__powerpc64__) && defined(__LITTLE_ENDIAN__)
+#  define DEFAULT_TARGET_NAME "powerpc64le-unknown-linux-gnu"
 # else
 #  warning "Unable to detect a suitable default target (linux-gnu)"
+# endif
+// - msys/cygwin
+#elif defined(__CYGWIN__)
+# if defined(__x86_64__)
+#  define DEFAULT_TARGET_NAME "x86_64-pc-windows-gnu"
+# else
+#  define DEFAULT_TARGET_NAME "i586-pc-windows-gnu"
 # endif
 // - MinGW
 #elif defined(__MINGW32__)
@@ -74,7 +85,11 @@
 # define DEFAULT_TARGET_NAME "x86_64-unknown-dragonfly"
 // - Apple devices
 #elif defined(__APPLE__)
-# define DEFAULT_TARGET_NAME "x86_64-apple-macosx"
+# if defined(__aarch64__)
+#  define DEFAULT_TARGET_NAME "aarch64-apple-macosx"
+# else
+#  define DEFAULT_TARGET_NAME "x86_64-apple-macosx"
+#endif
 // - Haiku
 #elif defined(__HAIKU__)
 # if defined(__x86_64__)

@@ -90,45 +90,56 @@ namespace AST {
 }
 ::std::ostream& operator<<(::std::ostream& os, const Pattern& pat)
 {
-    if( pat.m_binding.is_valid() ) {
-        os << pat.m_binding << " @ ";
+    for(const auto& pb : pat.m_bindings) {
+        os << pb << " @ ";
     }
-    TU_MATCH(Pattern::Data, (pat.m_data), (ent),
-    (MaybeBind,
+    TU_MATCH_HDRA( (pat.m_data), {)
+    TU_ARMA(MaybeBind, ent) {
         os << ent.name << "?";
-        ),
-    (Macro,
+        }
+    TU_ARMA(Macro, ent) {
         os << *ent.inv;
-        ),
-    (Any,
+        }
+    TU_ARMA(Any, ent) {
         os << "_";
-        ),
-    (Box,
+        }
+    TU_ARMA(Box, ent) {
         os << "box " << *ent.sub;
-        ),
-    (Ref,
+        }
+    TU_ARMA(Ref, ent) {
         os << "&" << (ent.mut ? "mut " : "") << *ent.sub;
-        ),
-    (Value,
+        }
+    TU_ARMA(Value, ent) {
         os << ent.start;
         if( ! ent.end.is_Invalid() )
-            os << " ... " << ent.end;
-        ),
-    (Tuple,
+            os << " ..= " << ent.end;
+        }
+    TU_ARMA(ValueLeftInc, ent) {
+        os << ent.start << " .. " << ent.end;
+        }
+    TU_ARMA(Tuple, ent) {
         os << "(" << ent << ")";
-        ),
-    (StructTuple,
+        }
+    TU_ARMA(StructTuple, ent) {
         os << ent.path << " (" << ent.tup_pat << ")";
-        ),
-    (Struct,
-        os << ent.path << " {" << ent.sub_patterns << "}";
-        ),
-    (Slice,
+        }
+    TU_ARMA(Struct, ent) {
+        os << ent.path << " {";
+        for(const auto& e : ent.sub_patterns) {
+            os << e.attrs;
+            os << e.name << ": " << e.pat;
+            os << ",";
+        }
+        os << "}";
+        if(ent.is_exhaustive)
+            os << "..";
+        }
+    TU_ARMA(Slice, ent) {
         os << "[";
         os << ent.sub_pats;
         os << "]";
-        ),
-    (SplitSlice,
+        }
+    TU_ARMA(SplitSlice, ent) {
         os << "[";
         bool needs_comma = false;
         if(ent.leading.size()) {
@@ -151,8 +162,14 @@ namespace AST {
             os << ent.trailing;
         }
         os << "]";
-        )
-    )
+        }
+    TU_ARMA(Or, ent) {
+        os << "(";
+        for(const auto& e : ent)
+            os << (&e == &ent.front() ? "" : " | ") << e;
+        os << ")";
+        }
+    }
     return os;
 }
 
@@ -164,7 +181,9 @@ AST::Pattern AST::Pattern::clone() const
 {
     AST::Pattern    rv;
     rv.m_span = m_span;
-    rv.m_binding = PatternBinding(m_binding);
+    for(const auto& pb : m_bindings) {
+        rv.m_bindings.push_back(pb);
+    }
 
     struct H {
         static ::std::unique_ptr<Pattern> clone_sp(const ::std::unique_ptr<Pattern>& p) {
@@ -197,44 +216,50 @@ AST::Pattern AST::Pattern::clone() const
         }
     };
 
-    TU_MATCH(Pattern::Data, (m_data), (e),
-    (Any,
+    TU_MATCH_HDRA( (m_data), {)
+    TU_ARMA(Any, e) {
         rv.m_data = Data::make_Any(e);
-        ),
-    (MaybeBind,
+        }
+    TU_ARMA(MaybeBind, e) {
         rv.m_data = Data::make_MaybeBind(e);
-        ),
-    (Macro,
+        }
+    TU_ARMA(Macro, e) {
         rv.m_data = Data::make_Macro({ ::std::make_unique<AST::MacroInvocation>( e.inv->clone() ) });
-        ),
-    (Box,
+        }
+    TU_ARMA(Box, e) {
         rv.m_data = Data::make_Box({ H::clone_sp(e.sub) });
-        ),
-    (Ref,
+        }
+    TU_ARMA(Ref, e) {
         rv.m_data = Data::make_Ref({ e.mut, H::clone_sp(e.sub) });
-        ),
-    (Value,
+        }
+    TU_ARMA(Value, e) {
         rv.m_data = Data::make_Value({ H::clone_val(e.start), H::clone_val(e.end) });
-        ),
-    (Tuple,
+        }
+    TU_ARMA(ValueLeftInc, e) {
+        rv.m_data = Data::make_ValueLeftInc({ H::clone_val(e.start), H::clone_val(e.end) });
+        }
+    TU_ARMA(Tuple, e) {
         rv.m_data = Data::make_Tuple( H::clone_tup(e) );
-        ),
-    (StructTuple,
+        }
+    TU_ARMA(StructTuple, e) {
         rv.m_data = Data::make_StructTuple({ ::AST::Path(e.path), H::clone_tup(e.tup_pat) });
-        ),
-    (Struct,
-        ::std::vector< ::std::pair< RcString, Pattern> >   sps;
+        }
+    TU_ARMA(Struct, e) {
+        ::std::vector<AST::StructPatternEntry>  sps;
         for(const auto& sp : e.sub_patterns)
-            sps.push_back( ::std::make_pair(sp.first, sp.second.clone()) );
+            sps.push_back(AST::StructPatternEntry { sp.attrs.clone(), sp.name, sp.pat.clone() });
         rv.m_data = Data::make_Struct({ ::AST::Path(e.path), mv$(sps) });
-        ),
-    (Slice,
+        }
+    TU_ARMA(Slice, e) {
         rv.m_data = Data::make_Slice({ H::clone_list(e.sub_pats) });
-        ),
-    (SplitSlice,
+        }
+    TU_ARMA(SplitSlice, e) {
         rv.m_data = Data::make_SplitSlice({ H::clone_list(e.leading), e.extra_bind, H::clone_list(e.trailing) });
-        )
-    )
+        }
+    TU_ARMA(Or, e) {
+        rv.m_data = Data::make_Or( H::clone_list(e) );
+        }
+    }
 
     return rv;
 }

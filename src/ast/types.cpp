@@ -28,7 +28,7 @@ static const struct {
     {"i32", CORETYPE_I32},
     {"i64", CORETYPE_I64},
     {"i8", CORETYPE_I8},
-    {"int", CORETYPE_INT},
+    //{"int", CORETYPE_INT},
     {"isize", CORETYPE_INT},
     {"str", CORETYPE_STR},
     {"u128", CORETYPE_U128},
@@ -36,7 +36,7 @@ static const struct {
     {"u32", CORETYPE_U32},
     {"u64", CORETYPE_U64},
     {"u8",  CORETYPE_U8},
-    {"uint", CORETYPE_UINT},
+    //{"uint", CORETYPE_UINT},
     {"usize", CORETYPE_UINT},
 };
 
@@ -230,7 +230,10 @@ Ordering TypeRef::ord(const TypeRef& x) const
         return ::ord(ent.traits, x_ent.traits);
         ),
     (ErasedType,
-        return ::ord(ent.traits, x_ent.traits);
+        ORD(ent.traits, ent.traits);
+        ORD(ent.maybe_traits, ent.maybe_traits);
+        ORD(ent.lifetimes, ent.lifetimes);
+        return OrdEqual;
         )
     )
     throw ::std::runtime_error(FMT("BUGCHECK - Unhandled TypeRef class '" << m_data.tag() << "'"));
@@ -329,11 +332,23 @@ void TypeRef::print(::std::ostream& os, bool is_debug/*=false*/) const
         )
     _(ErasedType,
         os << "impl ";
+        bool needs_plus = false;
         for( const auto& it : ent.traits ) {
-            if( &it != &ent.traits.front() )
-                os << "+";
+            if(needs_plus)  os << "+";
+            needs_plus = true;
             os << it.hrbs;
             it.path->print_pretty(os, true, is_debug);
+        }
+        for( const auto& it : ent.maybe_traits ) {
+            if(needs_plus)  os << "+";
+            needs_plus = true;
+            os << it.hrbs;
+            it.path->print_pretty(os, true, is_debug);
+        }
+        for( const auto& it : ent.lifetimes ) {
+            if(needs_plus)  os << "+";
+            needs_plus = true;
+            os << it;
         }
         os << "";
         )

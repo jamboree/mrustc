@@ -46,9 +46,10 @@ MirBuilder::MirBuilder(const Span& sp, const StaticTraitResolve& resolve, const 
     for(size_t i = 0; i < args.size(); i ++)
     {
         const auto& pat = args[i].first;
-        if( pat.m_binding.is_valid() && pat.m_binding.m_type == ::HIR::PatternBinding::Type::Move )
+        if( pat.m_bindings.size() == 1 && pat.m_bindings[0].m_type == ::HIR::PatternBinding::Type::Move )
         {
-            m_var_arg_mappings[pat.m_binding.m_slot] = i;
+            DEBUG("Argument shortcut: " << pat.m_bindings[0] << " -> a" << i);
+            m_var_arg_mappings[pat.m_bindings[0].m_slot] = i;
         }
     }
 
@@ -1215,8 +1216,30 @@ namespace
                     #endif
                 }
                 return ;
-            case VarState::TAG_MovedOut:
-                TODO(sp, "Handle Optional->MovedOut in split scope");
+            case VarState::TAG_MovedOut: {
+                // Should become `MovedOut` with a flag
+                // - If this `MovedOut` has a flag, then propagate that into the `Optional`'s flag and reset
+                if( new_state.as_MovedOut().outer_flag != ~0u ) {
+                    if( old_state.as_Optional() != new_state.as_MovedOut().outer_flag ) {
+                        builder.push_stmt_set_dropflag_other(sp, old_state.as_Optional(), new_state.as_MovedOut().outer_flag);
+                        builder.push_stmt_set_dropflag_default(sp, new_state.as_MovedOut().outer_flag);
+                    }
+                }
+                // Create an old state that just wraps a copy of the `Optional`
+                old_state = VarState::make_MovedOut({ std::make_unique<VarState>(old_state.clone()), old_state.as_Optional() });
+
+                bool is_box = false;
+                builder.with_val_type(sp, lv, [&](const auto& ty){
+                    is_box = builder.is_type_owned_box(ty);
+                    });
+
+                if( is_box ) {
+                    merge_state(sp, builder, ::MIR::LValue::new_Deref(lv.clone()), *old_state.as_MovedOut().inner_state, *new_state.as_MovedOut().inner_state);
+                }
+                else {
+                    BUG(sp, "MovedOut on non-Box");
+                }
+                return; }
             case VarState::TAG_Partial: {
                 const auto& nse = new_state.as_Partial();
                 bool is_enum = false;
@@ -1481,7 +1504,7 @@ void MirBuilder::end_split_arm(const Span& sp, const ScopeHandle& handle, bool r
             // Clone this arm's state
             for(auto& ent : this_arm_state.states)
             {
-                DEBUG("Slot(" << ent.first << ") = " << ent.second);
+                DEBUG("State _" << ent.first << " = " << ent.second);
                 sd_split.end_state.states.insert(::std::make_pair( ent.first, ent.second.clone() ));
             }
             for(auto& ent : this_arm_state.arg_states)
@@ -1927,6 +1950,8 @@ VarState& MirBuilder::get_slot_state_mut(const Span& sp, unsigned int idx, SlotT
                 }
             }
         }
+        // DISABLED: Long-ish experiment for allowing moves within match conditions (hopefully won't break codegen)
+#if 0
         // Freeze is used for `match` guards
         // - These are only allowed to modify the (known `bool`) condition variable
         // TODO: Some guards have more complex pieces of code, with self-contained scopes, allowable?
@@ -1956,6 +1981,7 @@ VarState& MirBuilder::get_slot_state_mut(const Span& sp, unsigned int idx, SlotT
                 break;  // Stop searching
             }
         }
+#endif
         else
         {
             // Unknown scope type?

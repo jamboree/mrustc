@@ -18,15 +18,6 @@
 
 namespace
 {
-    size_t PTR_BASE = 0x1000;   // See matching value in standalone_miri value.hpp
-
-    size_t Target_GetSizeOf_Required(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& ty)
-    {
-        size_t size;
-        bool type_has_size = Target_GetSizeOf(sp, resolve, ty, size);
-        ASSERT_BUG(sp, type_has_size, "Attempting to get the size of a unsized type");
-        return size;
-    }
 
     template<typename T>
     struct Fmt
@@ -265,9 +256,9 @@ namespace
             m_outfile_path(outfile),
             m_of(m_outfile_path + ".mir")
         {
-            for( const auto& crate : m_crate.m_ext_crates )
+            for( const auto& crate_name : m_crate.m_ext_crates_ordered )
             {
-                m_of << "crate \"" << FmtEscaped(crate.second.m_path) << ".mir\";\n";
+                m_of << "crate \"" << FmtEscaped(m_crate.m_ext_crates.at(crate_name).m_path) << ".mir\";\n";
             }
         }
 
@@ -495,6 +486,7 @@ namespace
             // Create constructor function
             const auto& var_ty = item.m_data.as_Data().at(var_idx).type;
             const auto& e = var_ty.data().as_Path().binding.as_Struct()->m_data.as_Tuple();
+            m_of << "/* " << var_path << " */\n";
             m_of << "fn " << fmt(var_path) << "(";
             for(unsigned int i = 0; i < e.size(); i ++)
             {
@@ -524,6 +516,7 @@ namespace
             auto monomorph = [&](const auto& x)->const auto& { return m_resolve.monomorph_expand_opt(sp, tmp, x, ms); };
             // Create constructor function
             const auto& e = item.m_data.as_Tuple();
+            m_of << "/* " << p << " */\n";
             m_of << "fn " << fmt(p) << "(";
             for(unsigned int i = 0; i < e.size(); i ++)
             {
@@ -656,7 +649,7 @@ namespace
                 }
             TU_ARM(repr->variants, NonZero, e) {
                 m_of << "\t@[" << e.field.index << ", " << e.field.sub_fields << "] = { ";
-                for(int i = 0; i < 2; i ++)
+                for(size_t i = 0; i < 2; i ++)
                 {
                     if( i == 1 ) {
                         m_of << ", ";
@@ -746,6 +739,7 @@ namespace
                 ::HIR::TypeRef  ret_type_tmp;
                 const auto& ret_type = monomorphise_fcn_return(ret_type_tmp, item, params);
 
+                m_of << "/* " << p << " */\n";
                 m_of << "fn " << fmt(p) << "(";
                 for(unsigned int i = 0; i < item.m_args.size(); i ++)
                 {
@@ -772,6 +766,7 @@ namespace
             m_mir_res = &mir_res;
 
             // - Signature
+            m_of << "/* " << p << " */\n";
             m_of << "fn " << fmt(p) << "(";
             for(unsigned int i = 0; i < item.m_args.size(); i ++)
             {
@@ -947,6 +942,30 @@ namespace
                         }
                         m_of << ":" << se.flags << "]";
                         } break;
+                    TU_ARM(stmt, Asm2, se) {
+                        m_of << "ASM2 (";
+                        for(const auto& l : se.lines)
+                            m_of << l;
+                        for(const auto& p : se.params)
+                        {
+                            m_of << ", ";
+                            TU_MATCH_HDRA((p), {)
+                            TU_ARMA(Const, v)
+                                m_of << "const " << fmt(v);
+                            TU_ARMA(Sym, v)
+                                m_of << "sym " << fmt(v);
+                            TU_ARMA(Reg, v) {
+                                m_of << "reg(" << v.dir << " " << v.spec << ") ";
+                                if(v.input ) m_of << fmt(*v.input ); else m_of << "_";
+                                m_of << " => ";
+                                if(v.output) m_of << fmt(*v.output); else m_of << "_";
+                                }
+                            }
+                        }
+                        m_of << ", ";
+                        se.options.fmt(m_of);
+                        m_of << ")";
+                        } break;
                     TU_ARM(stmt, ScopeEnd, se) { (void)se;
                         continue ;
                         } break;
@@ -1010,6 +1029,31 @@ namespace
                             m_of << "\"" << FmtEscaped(ve[i]) << "\" = " << e.targets[i] << ",";
                         }
                         break;
+                    TU_ARM(e.values, ByteString, ve) {
+                        for(size_t j = 0; j < ve.size(); j ++)
+                        {
+                            m_of << "b\"";
+                            for(size_t i = 0; i < ve[j].size(); i ++) {
+                                auto b = ve[j][i];
+                                switch(b)
+                                {
+                                case '\\': m_of << "\\\\"; break;
+                                case '\"': m_of << "\\\""; break;
+                                default:
+                                    if( ' ' <= b && b < 0x7f ) {
+                                        m_of << char(ve[j][i]);
+                                    }
+                                    else {
+                                        m_of << "\\x";
+                                        m_of << "0123456789ABCDEF"[b >> 4];
+                                        m_of << "0123456789ABCDEF"[b & 15];
+                                    }
+                                    break;
+                                }
+                            }
+                            m_of << "\" = " << e.targets[i] << ",";
+                        }
+                        } break;
                     TU_ARM(e.values, Unsigned, ve)
                         for(size_t i = 0; i < ve.size(); i++)
                         {
@@ -1069,23 +1113,29 @@ namespace
     private:
         const ::HIR::TypeRef& monomorphise_fcn_return(::HIR::TypeRef& tmp, const ::HIR::Function& item, const Trans_Params& params)
         {
-            if( visit_ty_with(item.m_return, [&](const auto& x){ return x.data().is_ErasedType() || x.data().is_Generic(); }) )
+            bool has_erased = visit_ty_with(item.m_return, [&](const auto& x) { return x.data().is_ErasedType(); });
+            
+            if( has_erased || monomorphise_type_needed(item.m_return) )
             {
-                tmp = clone_ty_with(Span(), item.m_return, [&](const auto& tpl, auto& out) {
-                    if( const auto* e = tpl.data().opt_ErasedType() )
-                    {
-                        out = params.monomorph(m_resolve, item.m_code.m_erased_types.at(e->m_index));
-                        return true;
-                    }
-                    else if( tpl.data().is_Generic() ) {
-                        out = params.monomorph_type(sp, tpl).clone();
-                        return true;
-                    }
-                    else {
-                        return false;
-                    }
-                });
-                m_resolve.expand_associated_types(sp, tmp);
+                // If there's an erased type, make a copy with the erased type expanded
+                if( has_erased )
+                {
+                    tmp = clone_ty_with(sp, item.m_return, [&](const auto& x, auto& out) {
+                        if( const auto* te = x.data().opt_ErasedType() ) {
+                            out = item.m_code.m_erased_types.at(te->m_index).clone();
+                            return true;
+                        }
+                        else {
+                            return false;
+                        }
+                        });
+                    tmp = params.monomorph_type(Span(), tmp).clone();
+                }
+                else
+                {
+                    tmp = params.monomorph_type(Span(), item.m_return).clone();
+                }
+                m_resolve.expand_associated_types(Span(), tmp);
                 return tmp;
             }
             else

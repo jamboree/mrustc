@@ -45,17 +45,6 @@ using ::std::move;
 
 typedef bool    Visibility;
 
-enum eItemType
-{
-    ITEM_TRAIT,
-    ITEM_STRUCT,
-    ITEM_ENUM,
-    ITEM_UNION,
-    ITEM_FN,
-    ITEM_EXTERN_FN,
-    ITEM_STATIC,
-};
-
 struct StructItem
 {
     ::AST::AttributeList   m_attrs;
@@ -121,6 +110,19 @@ public:
 
     TypeAlias clone() const;
 };
+class TraitAlias
+{
+public:
+    GenericParams  params;
+    std::vector<Spanned<Type_TraitPath>>  traits;
+
+    TraitAlias clone() const {
+        TraitAlias  rv;
+        for(const auto& p : this->traits)
+            rv.traits.push_back(p);
+        return rv;
+    }
+};
 
 class Static
 {
@@ -136,6 +138,10 @@ private:
     TypeRef m_type;
     Expr    m_value;
 public:
+    struct Markings {
+        std::string link_name;
+        std::string link_section;
+    } m_markings;
     Static(Class s_class, TypeRef type, Expr value):
         m_class(s_class),
         m_type( move(type) ),
@@ -155,7 +161,20 @@ public:
 class Function
 {
 public:
-    typedef ::std::vector< ::std::pair<AST::Pattern,TypeRef> >   Arglist;
+    struct Arg
+    {
+        ::AST::AttributeList    attrs;
+        ::AST::Pattern  pat;
+        TypeRef  ty;
+
+        Arg(::AST::Pattern pat, TypeRef ty, ::AST::AttributeList attrs={})
+            : attrs(mv$(attrs))
+            , pat(mv$(pat))
+            , ty(mv$(ty))
+        {
+        }
+    };
+    typedef ::std::vector<Arg>   Arglist;
 
 private:
     Span    m_span;
@@ -169,6 +188,21 @@ private:
     bool    m_is_unsafe;
     bool    m_is_variadic;  // extern only
 public:
+    struct Markings {
+        enum Inline {
+            Auto,
+            Never,
+            Normal,
+            Always
+        } inline_type = Inline::Auto;
+        bool is_cold = false;
+        std::vector<unsigned>   rustc_legacy_const_generics;
+
+        std::string link_name;
+        std::string link_section;
+    } m_markings;
+
+
     Function(const Function&) = delete;
     Function& operator=(const Function&) = delete;
     Function(Function&&) = default;
@@ -310,6 +344,24 @@ class Enum
     GenericParams    m_params;
     ::std::vector<EnumVariant>   m_variants;
 public:
+
+    struct Markings {
+        enum class Repr {
+            Rust,
+            U8 ,
+            U16,
+            U32,
+            U64,
+            Usize,
+            I8,
+            I16,
+            I32,
+            I64,
+            Isize
+        } repr = Repr::Rust;
+        bool is_repr_c = false;
+    } m_markings;
+    
     Enum() {}
     Enum( GenericParams params, ::std::vector<EnumVariant> variants ):
         m_params( move(params) ),
@@ -351,6 +403,16 @@ public:
             memset(this, 0, sizeof(*this));
         }
 
+        enum class Repr {
+            Rust,
+            C,
+            Simd,
+            Transparent,
+        } repr = Repr::Rust;
+        uint64_t align_value = 0;
+        // Indicates packing
+        uint64_t max_field_align = 0;
+
         // 1.39 nonzero etc
         bool    scalar_valid_start_set;
         uint64_t    scalar_valid_start;
@@ -384,6 +446,13 @@ class Union
 public:
     GenericParams   m_params;
     ::std::vector<StructItem>   m_variants;
+    struct Markings {
+        enum class Repr {
+            Rust,
+            C,
+            Transparent,
+        } repr = Repr::Rust;
+    } m_markings;
 
     Union( GenericParams params, ::std::vector<StructItem> fields ):
         m_params( move(params) ),
@@ -498,6 +567,11 @@ class ExternBlock
     ::std::string   m_abi;
     ::std::vector< Named<Item>> m_items;
 public:
+    struct Link {
+        std::string lib_name;
+    };
+    std::vector<Link>   m_libraries;
+
     ExternBlock(::std::string abi):
         m_abi( mv$(abi) )
     {}
@@ -639,6 +713,7 @@ TAGGED_UNION_EX(Item, (), None,
     (Enum, Enum),
     (Union, Union),
     (Trait, Trait),
+    (TraitAlias, TraitAlias),
 
     (Function, Function),
     (Static, Static)

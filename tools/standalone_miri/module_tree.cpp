@@ -83,9 +83,7 @@ bool Parser::parse_one()
     if( lex.consume_if("crate") )
     {
         // Import an external crate
-        lex.check(TokenClass::String);
-        auto path = ::std::move(lex.next().strval);
-        lex.consume();
+        auto path = ::std::move(lex.check_consume(TokenClass::String).strval);
         //LOG_TRACE(lex << "crate '" << path << "'");
 
         lex.check_consume(';');
@@ -835,6 +833,152 @@ bool Parser::parse_one()
                     ::std::move(tpl), ::std::move(out_vals), ::std::move(in_vals), ::std::move(clobbers), ::std::move(flags)
                     }));
             }
+            else if( lex.consume_if("ASM2") )
+            {
+                ::MIR::Statement::Data_Asm2 stmt_asm2;
+                lex.check_consume('(');
+                do {
+                    auto text = std::move(lex.check_consume(TokenClass::String).strval);
+                    AsmCommon::Line line;
+
+                    // Stripped-down version of the parsing code from the main compiler
+                    const char* c = text.c_str();
+                    std::string cur_string;
+                    while(*c)
+                    {
+                        if(*c == '{')
+                        {
+                            AsmCommon::LineFragment frag;
+
+                            c ++;
+                            unsigned idx = 0;
+                            while(*c && *c != ':' && *c != '}')
+                            {
+                                LOG_ASSERT('0' <= *c && *c <= '9', lex << "Non-integer argument in asm! format string");
+                                idx *= 10;
+                                idx += *c - '0';
+                                c ++;
+                            }
+                            LOG_ASSERT(*c, lex << "Unexpected EOF in asm! format string");
+                            frag.index = idx;
+                            assert(*c == ':' || *c == '}');
+                            if(*c == ':')
+                            {
+                                c ++;
+                                LOG_ASSERT(*c, lex << "Unexpected EOF in asm! format string");
+                                if(*c != '}') {
+                                    frag.modifier = *c;
+                                    c ++;
+                                }
+                            }
+                            LOG_ASSERT(*c, lex << "Unexpected EOF in asm! format string");
+                            LOG_ASSERT(*c == '}', lex << "Expected '}' in asm! format string");
+
+                            frag.before = std::move(cur_string);
+                            cur_string.clear();
+                            line.frags.push_back(std::move(frag));
+                        }
+                        else {
+                            cur_string += *c;
+                        }
+                        c ++;
+                    }
+                    line.trailing = std::move(cur_string);
+                    stmt_asm2.lines.push_back(std::move(line));
+
+                    if( lex.next() == ')' )
+                        break;
+                } while( !lex.consume_if(',') );
+
+                // Arguments
+                while( !lex.consume_if(')') )
+                {
+                    if( lex.consume_if("const") )
+                    {
+                        stmt_asm2.params.push_back( H::parse_const(*this) );
+                    }
+                    else if( lex.consume_if("sym") )
+                    {
+                        stmt_asm2.params.push_back( HIR::Path { RcString(lex.check_consume(TokenClass::Ident).strval.c_str()) } );
+                    }
+                    else if( lex.consume_if("reg") )
+                    {
+                        MIR::AsmParam::Data_Reg param;
+                        lex.check_consume('(');
+                        // Direction
+                        lex.check(TokenClass::Ident);
+                        /**/ if( lex.consume_if("in" ) ) { param.dir = AsmCommon::Direction::In;  }
+                        else if( lex.consume_if("out") ) { param.dir = AsmCommon::Direction::Out; }
+                        else if( lex.consume_if("lateout") ) { param.dir = AsmCommon::Direction::LateOut; }
+                        else if( lex.consume_if("inlateout") ) { param.dir = AsmCommon::Direction::InLateOut; }
+                        else {
+                            LOG_ERROR(lex << "Unexpected token in ASM2 direction - " << lex.next());
+                        }
+                        // Spec
+                        if( lex.next() == TokenClass::String ) {
+                            param.spec = lex.consume().strval;
+                        }
+                        else if( lex.next() == TokenClass::Ident ) {
+#define GET(_suf, _name)  if( lex.consume_if(#_name) ) { param.spec = AsmCommon::RegisterClass::_suf ## _ ## _name; }
+                            /**/ GET(x86, reg)
+                            else GET(x86, reg_byte)
+                            else {
+                                LOG_ERROR(lex << "Unexpected token in ASM2 register class - " << lex.next());
+                            }
+#undef GET
+                        }
+                        else {
+                            LOG_ERROR(lex << "Unexpected token in ASM2 reg spec - " << lex.next());
+                        }
+                        lex.check_consume(')');
+                        if( !lex.consume_if('_') ) {
+                            param.input = std::make_unique<MIR::Param>(H::parse_param(*this, var_names));
+                        }
+                        lex.check_consume('=');
+                        lex.check_consume('>');
+                        if( !lex.consume_if('_') ) {
+                            param.output = std::make_unique<MIR::LValue>(H::parse_lvalue(*this, var_names));
+                        }
+
+                        stmt_asm2.params.push_back(std::move(param));
+                    }
+                    else if( lex.consume_if("options") )
+                    {
+                        lex.check_consume('(');
+                        
+                        do {
+                            if( lex.next() == ')' )
+                                break;
+                            
+                            lex.check(TokenClass::Ident);
+#define FLAG(_name)  if( lex.consume_if(#_name) ) { stmt_asm2.options._name = true; }
+                            /**/ FLAG(pure)
+                            else FLAG(nomem)
+                            else FLAG(readonly)
+                            else FLAG(preserves_flags)
+                            else FLAG(noreturn)
+                            else FLAG(nostack)
+                            else FLAG(att_syntax)
+                            else {
+                                LOG_ERROR(lex << "Unexpected token in ASM2 options - " << lex.next());
+                            }
+#undef FLAG
+
+                        } while( lex.consume_if(',') );
+                        lex.check_consume(')');
+                    }
+                    else
+                    {
+                        LOG_ERROR(lex << "Unexpected token in ASM2 argument - " << lex.next());
+                    }
+                    if( !lex.consume_if(',') ) {
+                        lex.consume_if(')');
+                        break;
+                    }
+                }
+
+                stmts.push_back(std::move(stmt_asm2));
+            }
             else
             {
                 break;
@@ -1053,8 +1197,7 @@ RawType Parser::parse_core_type()
         auto rv = parse_type();
         if( lex.consume_if(';') )
         {
-            size_t size = lex.next().integer();
-            lex.consume();
+            size_t size = lex.check_consume(TokenClass::Integer).integer();
             lex.check_consume(']');
             return ::std::move(rv).wrap( TypeWrapper::Ty::Array, size );
         }

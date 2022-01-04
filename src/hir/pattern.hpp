@@ -139,9 +139,11 @@ struct Pattern
                 return sub_patterns.empty() && !is_exhaustive;
             }
             } ),
+        // Split/or patterns
+        (Or, std::vector<Pattern>),
         // Always refutable
         (Value,     struct { Value val; } ),
-        (Range,     struct { Value start; Value end; } ),
+        (Range,     struct { std::unique_ptr<Value> start; std::unique_ptr<Value> end; bool is_inclusive; } ),
         (Slice,     struct {
             ::std::vector<Pattern> sub_patterns;
             } ),
@@ -152,15 +154,23 @@ struct Pattern
             } )
         );
 
-    PatternBinding  m_binding;
+    std::vector<PatternBinding> m_bindings;
     Data    m_data;
     unsigned m_implicit_deref_count = 0;
 
     Pattern() {}
-    Pattern(PatternBinding pb, Data d):
-        m_binding( mv$(pb) ),
+    Pattern(std::vector<PatternBinding> pbs, Data d):
+        m_bindings(mv$(pbs)),
         m_data( mv$(d) )
-    {}
+    {
+    }
+    Pattern(PatternBinding pb, Data d):
+        m_data( mv$(d) )
+    {
+        if(pb.is_valid()) {
+            m_bindings.push_back(std::move(pb));
+        }
+    }
     Pattern(const Pattern&) = delete;
     Pattern(Pattern&&) = default;
     Pattern& operator=(const Pattern&) = delete;

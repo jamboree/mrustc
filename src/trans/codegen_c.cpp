@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <hir/hir.hpp>
+#include <limits>
 #include <mir/mir.hpp>
 #include <hir_typeck/static.hpp>
 #include <mir/helpers.hpp>
@@ -205,6 +206,7 @@ namespace {
             m_outfile_path_c(outfile + ".c"),
             m_of(m_outfile_path_c)
         {
+            ASSERT_BUG(Span(), m_of.is_open(), "Failed to open `" << m_outfile_path_c << "` for writing");
             m_options.emulated_i128 = Target_GetCurSpec().m_backend_c.m_emulated_i128;
             switch(Target_GetCurSpec().m_backend_c.m_codegen_mode)
             {
@@ -257,6 +259,7 @@ namespace {
             }
             m_of
                 << "typedef uint32_t RUST_CHAR;\n"
+                << "typedef uint8_t RUST_BOOL;\n"
                 << "typedef struct { void* PTR; size_t META; } SLICE_PTR;\n"
                 << "typedef struct { void* PTR; void* META; } TRAITOBJ_PTR;\n"
                 << "typedef struct { void (*drop)(void*); size_t size; size_t align; } VTABLE_HDR;\n"
@@ -850,18 +853,45 @@ namespace {
                         m_of << "}\n";
                     }
 
-                    // TODO: Bind `oom` lang item to the item tagged with `alloc_error_handler`
-                    // - Can do this in enumerate/auto_impls instead, for better iteraction with enum
-                    // XXX: HACK HACK HACK - This only works with libcore/libstd's current layout
-                    auto layout_path = ::HIR::SimplePath("core", {"alloc", "Layout"});
-                    //auto oom_method = ::HIR::SimplePath("std", {"alloc", "rust_oom"});
-                    auto oom_method = m_crate.get_lang_item_path(Span(), "mrustc-alloc_error_handler");
-                    m_of << "struct s_" << Trans_Mangle(layout_path) << "_A { uintptr_t a, b; };\n";
-                    m_of << "void oom_impl(struct s_" << Trans_Mangle(layout_path) << "_A l) {"
-                        << " extern void " << Trans_Mangle(oom_method) << "(struct s_" << Trans_Mangle(layout_path) << "_A l);"
-                        << " " << Trans_Mangle(oom_method) << "(l);"
-                        << " }\n"
-                        ;
+                    if( TARGETVER_LEAST_1_54 )
+                    {
+                        auto oom_method = m_crate.get_lang_item_path_opt("mrustc-alloc_error_handler");
+                        m_of << "void __rust_alloc_error_handler(uintptr_t s, uintptr_t a) {\n";
+                        if(oom_method == HIR::SimplePath()) {
+                            m_of << "\tvoid __rdl_oom(uintptr_t, uintptr_t);\n";
+                            m_of << "\t__rdl_oom(s,a);\n";
+                        }
+                        else {
+                            m_of << "\tvoid __rg_oom(uintptr_t, uintptr_t);\n";
+                            m_of << "\t__rg_oom(s,a);\n";
+                        }
+                        m_of << "}\n";
+
+                        if(oom_method != HIR::SimplePath()) {
+                            auto layout_path = ::HIR::SimplePath("core", {"alloc", "Layout"});
+                            m_of << "struct s_" << Trans_Mangle(layout_path) << "_A { uintptr_t a, b; };\n";
+                            m_of << "void oom_impl(struct s_" << Trans_Mangle(layout_path) << "_A l) {"
+                                << " extern void " << Trans_Mangle(oom_method) << "(struct s_" << Trans_Mangle(layout_path) << "_A l);"
+                                << " " << Trans_Mangle(oom_method) << "(l);"
+                                << " }\n"
+                                ;
+                        }
+                    }
+                    else
+                    {
+                        // TODO: Bind `oom` lang item to the item tagged with `alloc_error_handler`
+                        // - Can do this in enumerate/auto_impls instead, for better iteraction with enum
+                        // XXX: HACK HACK HACK - This only works with libcore/libstd's current layout
+                        auto layout_path = ::HIR::SimplePath("core", {"alloc", "Layout"});
+                        //auto oom_method = ::HIR::SimplePath("std", {"alloc", "rust_oom"});
+                        auto oom_method = m_crate.get_lang_item_path(Span(), "mrustc-alloc_error_handler");
+                        m_of << "struct s_" << Trans_Mangle(layout_path) << "_A { uintptr_t a, b; };\n";
+                        m_of << "void oom_impl(struct s_" << Trans_Mangle(layout_path) << "_A l) {"
+                            << " extern void " << Trans_Mangle(oom_method) << "(struct s_" << Trans_Mangle(layout_path) << "_A l);"
+                            << " " << Trans_Mangle(oom_method) << "(l);"
+                            << " }\n"
+                            ;
+                    }
                 }
 
 
@@ -878,6 +908,7 @@ namespace {
 
             m_of.flush();
             m_of.close();
+            ASSERT_BUG(Span(), !m_of.bad(), "Error set on output stream for: " << m_outfile_path_c);
 
             class LinkList: private StringList
             {
@@ -952,9 +983,9 @@ namespace {
             {
             case CodegenOutput::Executable:
             case CodegenOutput::DynamicLibrary:
-                for( const auto& crate : m_crate.m_ext_crates )
+                for( const auto& crate_name : m_crate.m_ext_crates_ordered )
                 {
-
+                    const auto& crate = m_crate.m_ext_crates.at(crate_name);
                     auto is_dylib = [](const ::HIR::ExternCrate& c) {
                         bool rv = false;
                         // TODO: Better rule than this
@@ -970,8 +1001,8 @@ namespace {
                         {
                             for(const auto& subcrate : crate2.second.m_data->m_ext_crates)
                             {
-                                if( subcrate.second.m_path == crate.second.m_path ) {
-                                    DEBUG(crate.first << " referenced by dylib " << crate2.first);
+                                if( subcrate.second.m_path == crate.m_path ) {
+                                    DEBUG(crate_name << " referenced by dylib " << crate2.first);
                                     is_in_dylib = true;
                                 }
                             }
@@ -980,31 +1011,31 @@ namespace {
                             break;
                     }
                     // NOTE: Only exclude non-dylibs referenced by other dylibs
-                    if( is_in_dylib && !is_dylib(crate.second) )
+                    if( is_in_dylib && !is_dylib(crate) )
                         continue ;
 
                     // Ignore panic crates unless they're the selected crate (and add in the selected panic crate)
-                    if( crate.second.m_data->m_lang_items.count("mrustc-panic_runtime") )
+                    if( crate.m_data->m_lang_items.count("mrustc-panic_runtime") )
                     {
                         // Check if this is the requested panic crate
-                        if( strncmp(crate.first.c_str(), opt.panic_crate.c_str(), opt.panic_crate.size()) != 0 )
+                        if( strncmp(crate_name.c_str(), opt.panic_crate.c_str(), opt.panic_crate.size()) != 0 )
                         {
-                            DEBUG("Ignore not-selected panic crate: " << crate.first);
+                            DEBUG("Ignore not-selected panic crate: " << crate_name);
                             continue ;
                         }
                         else
                         {
-                            DEBUG("Keep panic crate: " << crate.first);
+                            DEBUG("Keep panic crate: " << crate_name);
                         }
                     }
 
-                    if( crate.second.m_path.compare(crate.second.m_path.size() - 5, 5, ".rlib") == 0)
+                    if( crate.m_path.compare(crate.m_path.size() - 5, 5, ".rlib") == 0)
                     {
-                        ext_crates.push_back(crate.second.m_path.c_str());
+                        ext_crates.push_back(crate.m_path.c_str());
                     }
-                    else if( is_dylib(crate.second) )
+                    else if( is_dylib(crate) )
                     {
-                        ext_crates_dylib.push_back(crate.second.m_path.c_str());
+                        ext_crates_dylib.push_back(crate.m_path.c_str());
                     }
                     else
                     {
@@ -1067,21 +1098,22 @@ namespace {
                     libraries_and_dirs.push_lib(lib.name.c_str());
                 }
 
-                for( const auto& crate : m_crate.m_ext_crates )
+                for( const auto& crate_name : m_crate.m_ext_crates_ordered )
                 {
-                    if( !crate.second.m_data->m_ext_libs.empty() )
+                    const auto& crate = m_crate.m_ext_crates.at(crate_name);
+                    if( !crate.m_data->m_ext_libs.empty() )
                     {
-                        if( !crate.second.m_data->m_link_paths.empty() ) {
+                        if( !crate.m_data->m_link_paths.empty() ) {
                             libraries_and_dirs.push_border();
                         }
-                        for(const auto& path : crate.second.m_data->m_link_paths ) {
+                        for(const auto& path : crate.m_data->m_link_paths ) {
                             libraries_and_dirs.push_dir(path.c_str());
                         }
                         // NOTE: Does explicit lookup, to provide scoped search directories
                         // - Needed for 1.39 cargo on linux when libgit2 and libz exist on the system, butsystem libgit2 isn't new enough
-                        for(const auto& lib : crate.second.m_data->m_ext_libs) {
-                            ASSERT_BUG(Span(), lib.name != "", "Empty lib from " << crate.first);
-                            auto path = H::find_library(crate.second.m_data->m_link_paths, opt.library_search_dirs, lib.name, m_compiler == Compiler::Msvc);
+                        for(const auto& lib : crate.m_data->m_ext_libs) {
+                            ASSERT_BUG(Span(), lib.name != "", "Empty lib from " << crate_name);
+                            auto path = H::find_library(crate.m_data->m_link_paths, opt.library_search_dirs, lib.name, m_compiler == Compiler::Msvc);
                             if( path != "" )
                             {
                                 libraries_and_dirs.push_explicit(std::move(path));
@@ -1112,8 +1144,8 @@ namespace {
             case Compiler::Gcc:
                 // Pick the compiler
                 // - from `CC_${TRIPLE}` environment variable, with all '-' in TRIPLE replaced by '_'
-                // - `${TRIPLE}-gcc` (if available)
                 // - from the `CC` environment variable
+                // - `${TRIPLE}-gcc` (if available)
                 // - `gcc` as fallback
                 {
                     std::string varname = "CC_" +  Target_GetCurSpec().m_backend_c.m_c_compiler;
@@ -1122,11 +1154,11 @@ namespace {
                     if( getenv(varname.c_str()) ) {
                         args.push_back( getenv(varname.c_str()) );
                     }
+                    else if( getenv("CC") ) {
+                            args.push_back( getenv("CC") );
+                    }
                     else if (system(("command -v " + Target_GetCurSpec().m_backend_c.m_c_compiler + "-gcc" + " >/dev/null 2>&1").c_str()) == 0) {
                         args.push_back( Target_GetCurSpec().m_backend_c.m_c_compiler + "-gcc" );
-                    }
-                    else if( getenv("CC") ) {
-                        args.push_back( getenv("CC") );
                     }
                     else {
                         args.push_back("gcc");
@@ -1178,6 +1210,7 @@ namespace {
                     {
                         args.push_back(c);
                     }
+                    args.push_back("-Wl,--start-group");    // Group to avoid linking ordering
                     //args.push_back("-Wl,--push-state");
                     for(auto l_d : libraries_and_dirs)
                     {
@@ -1192,8 +1225,14 @@ namespace {
                             args.push_back(l_d.second);
                             break;
                         case LinkList::Ty::Implicit:
-                            args.push_back("-l");
-                            args.push_back(l_d.second);
+                            if (!strncmp(l_d.second, "framework=", strlen("framework="))) {
+                                args.push_back("-framework");
+                                args.push_back(l_d.second + strlen("framework="));
+                            }
+                            else {
+                                args.push_back("-l");
+                                args.push_back(l_d.second);
+                            }
                             break;
                         case LinkList::Ty::Explicit:
                             args.push_back(l_d.second);
@@ -1201,6 +1240,7 @@ namespace {
                         }
                     }
                     //args.push_back("-Wl,--pop-state");
+                    args.push_back("-Wl,--end-group");    // Group to avoid linking ordering
                     for( const auto& a : Target_GetCurSpec().m_backend_c.m_linker_opts )
                     {
                         args.push_back( a.c_str() );
@@ -1244,6 +1284,7 @@ namespace {
                     case CodegenOutput::Executable:
                     case CodegenOutput::DynamicLibrary:
                         args.push_back("/Zi");  // Emit a PDB
+                        args.push_back(FMT("/Fd" << m_outfile_path << ".pdb")); // Set the PDB path
                         break;
                     case CodegenOutput::StaticLibrary:
                     case CodegenOutput::Object:
@@ -1313,6 +1354,7 @@ namespace {
             bool use_arg_file = arg_file_start > 0;
             if(use_arg_file) {
                 command_file_stream.open(command_file);
+                ASSERT_BUG(Span(), command_file_stream.is_open(), "Failed to open command file `" << command_file << "` for writing");
             }
             size_t i = -1;
             for(const auto& arg : args.get_vec())
@@ -1334,6 +1376,7 @@ namespace {
             if(use_arg_file) {
                 cmd_ss << "@\"" << FmtShell(command_file, is_windows) << "\"";
                 command_file_stream.close();
+                ASSERT_BUG(Span(), !command_file_stream.bad(), "Error set on output stream for: " << m_outfile_path_c);
             }
             //DEBUG("- " << cmd_ss.str());
             ::std::cout << "Running command - " << cmd_ss.str() << ::std::endl;
@@ -1369,7 +1412,7 @@ namespace {
             }
         }
 
-        void emit_box_drop(unsigned indent_level, const ::HIR::TypeRef& inner_type, const ::MIR::LValue& slot, bool run_destructor)
+        void emit_box_drop(unsigned indent_level, const ::HIR::TypeRef& inner_type, const ::HIR::TypeRef& box_type, const ::MIR::LValue& slot, bool run_destructor)
         {
             auto indent = RepeatLitStr { "\t", static_cast<int>(indent_level) };
             // Emit a call to box_free for the type
@@ -1386,15 +1429,45 @@ namespace {
                     ;
                 emit_destructor_call( ::MIR::LValue::new_Deref(mv$(inner_ptr)), inner_type, /*unsized_valid=*/true, indent_level );
             }
-            // TODO: This is specific to the official liballoc's owned_box
-            ::HIR::GenericPath  box_free { m_crate.get_lang_item_path(sp, "box_free"), { inner_type.clone() } };
+
+            // NOTE: This is specific to the official liballoc's owned_box
+            const auto& p = box_type.data().as_Path().path.m_data.as_Generic().m_params;
+            ::HIR::GenericPath  box_free { m_crate.get_lang_item_path(sp, "box_free"), p.clone() };
+
+            // If the allocator is a ZST, it won't exist in the type (need to create a dummy instance for the argument)
+            bool alloc_is_zst = false;
+            if( TARGETVER_LEAST_1_54 ) {
+                ::HIR::TypeRef  tmp;
+                const auto& ty = m_mir_res->get_lvalue_type(tmp, MIR::LValue::new_Field(slot.clone(), 1));
+                if( type_is_bad_zst(ty) ) {
+                    alloc_is_zst = true;
+                    m_of << indent << "{ ";
+                    emit_ctype(ty); m_of << " zst_alloc = {0};";
+                }
+            }
+
+            m_of << indent << Trans_Mangle(box_free) << "("; 
             if( TARGETVER_LEAST_1_29 ) {
                 // In 1.29, `box_free` takes Unique, so pass the Unique within the Box
-                m_of << indent << Trans_Mangle(box_free) << "("; emit_lvalue(slot); m_of << "._0);\n";
+                emit_lvalue(slot); m_of << "._0";
             }
             else {
-                m_of << indent << Trans_Mangle(box_free) << "("; emit_lvalue(slot); m_of << "._0._0._0);\n";
+                emit_lvalue(slot); m_of << "._0._0._0";
             }
+            // With 1.54, also need to pass the allocator
+            if( TARGETVER_LEAST_1_54 ) {
+                m_of << ", ";
+                if(alloc_is_zst) {
+                    m_of << "zst_alloc";
+                } else {
+                    emit_lvalue(slot); m_of << "._1";
+                }
+            }
+            m_of << ");";
+            if(alloc_is_zst) {
+                m_of << " }";
+            }
+            m_of << "\n";
         }
 
         void emit_type_id(const ::HIR::TypeRef& ty) override
@@ -1491,7 +1564,7 @@ namespace {
                 {
                     if(i != 0)  m_of << ",";
                     m_of << " ";
-                    emit_ctype(te.m_arg_types[i]);
+                    this->emit_ctype( te.m_arg_types[i], FMT_CB(os, os << (this->type_is_high_align(te.m_arg_types[i]) ? "*":"");) );
                 }
                 m_of << " )";
             }
@@ -1499,12 +1572,13 @@ namespace {
         }
 
         // Shared logic between `emit_struct` and `emit_type` (w/ Tuple)
-        void emit_struct_inner(const ::HIR::TypeRef& ty, const TypeRepr* repr, bool is_packed)
+        void emit_struct_inner(const ::HIR::TypeRef& ty, const TypeRepr* repr, unsigned packing_max_align)
         {
             // Fill `fields` with ascending indexes (for sorting)
             // AND: Determine if the type has a a zero-sized item that has an alignment equal to the structure's alignment
-            bool has_manual_align = false;
             ::std::vector<unsigned> fields;
+            size_t max_align = 0;
+            bool has_manual_align = false;
             for(const auto& ent : repr->fields)
             {
                 fields.push_back(fields.size());
@@ -1516,21 +1590,18 @@ namespace {
                 if( sz == 0 && al == repr->align && al > 0 ) {
                     has_manual_align = true;
                 }
+                max_align = std::max(max_align, al);
+            }
+            if(packing_max_align == 0 && max_align != repr->align /*&& repr->size > 0*/) {
+                has_manual_align = true;
             }
             // - Sort the fields by offset
             ::std::sort(fields.begin(), fields.end(), [&](auto a, auto b){ return repr->fields[a].offset < repr->fields[b].offset; });
 
             // For repr(packed), mark as packed
-            if(is_packed)
+            if(packing_max_align)
             {
-                switch(m_compiler)
-                {
-                case Compiler::Msvc:
-                    m_of << "#pragma pack(push, 1)\n";
-                    break;
-                case Compiler::Gcc:
-                    break;
-                }
+                m_of << "#pragma pack(push, " << packing_max_align << ")\n";
             }
             if(has_manual_align)
             {
@@ -1559,6 +1630,7 @@ namespace {
                 const auto offset = repr->fields[fld].offset;
                 size_t s = 0, a;
                 Target_GetSizeAndAlignOf(sp, m_resolve, ty, s, a);
+                DEBUG("@" << offset << ": " << ty << " " << s << "," << a);
 
                 // Check offset/alignment
                 if( s == SIZE_MAX )
@@ -1570,11 +1642,10 @@ namespace {
                 else
                 {
                     MIR_ASSERT(*m_mir_res, cur_ofs <= offset, "Current offset is already past expected (#" << fld << "): " << cur_ofs << " > " << offset);
-                    if(!is_packed)
-                    {
-                        while(cur_ofs % a != 0)
-                            cur_ofs ++;
-                    }
+                    a = packing_max_align > 0 ? std::min<size_t>(packing_max_align, a) : a;
+                    DEBUG("a = " << a);
+                    while(cur_ofs % a != 0)
+                        cur_ofs ++;
                     MIR_ASSERT(*m_mir_res, cur_ofs == offset, "Current offset doesn't match expected (#" << fld << "): " << cur_ofs << " != " << offset);
 
                     cur_ofs += s;
@@ -1617,7 +1688,7 @@ namespace {
                 m_of << "\tchar _d;\n";
             }
             m_of << "}";
-            if(is_packed || has_manual_align)
+            if(has_manual_align)
             {
                 switch(m_compiler)
                 {
@@ -1628,14 +1699,10 @@ namespace {
                         emit_ctype(ty);
                     }
                     m_of << ";";
-                    if( is_packed )
-                        m_of << "\n#pragma pack(pop)";
                     m_of << "\n";
                     break;
                 case Compiler::Gcc:
                     m_of << " __attribute__((";
-                    if( is_packed )
-                        m_of << "packed,";
                     if( has_manual_align )
                         m_of << "__aligned__(" << repr->align << "),";
                     m_of << "))";
@@ -1657,6 +1724,10 @@ namespace {
                 }
                 m_of << ";\n";
             }
+            if( packing_max_align != 0 )
+            {
+                m_of << "#pragma pack(pop)\n";
+            }
         }
 
         void emit_type(const ::HIR::TypeRef& ty) override
@@ -1676,7 +1747,7 @@ namespace {
                     m_of << " // " << ty << "\n";
                     const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
 
-                    emit_struct_inner(ty, repr, /*is_packed=*/false);
+                    emit_struct_inner(ty, repr, /*packing_max_align=*/0);
 
                     if( repr->size > 0 )
                     {
@@ -1742,7 +1813,6 @@ namespace {
             ::MIR::TypeResolve  top_mir_res { sp, m_resolve, FMT_CB(ss, ss << "struct " << p;), ::HIR::TypeRef(), {}, empty_fcn };
             m_mir_res = &top_mir_res;
             // TODO: repr(transparent) and repr(align(foo))
-            bool is_packed = item.m_repr == ::HIR::Struct::Repr::Packed;
 
             TRACE_FUNCTION_F(p);
             auto item_ty = ::HIR::TypeRef::new_path(p.clone(), &item);
@@ -1751,14 +1821,14 @@ namespace {
 
             m_of << "// struct " << p << "\n";
 
-            emit_struct_inner(item_ty, repr, is_packed);
+            emit_struct_inner(item_ty, repr, item.m_max_field_alignment);
 
             if(repr->size > 0 && repr->size != SIZE_MAX )
             {
                 // TODO: Handle unsized (should check the size of the fixed-size region)
                 m_of << "typedef char sizeof_assert_" << Trans_Mangle(p) << "[ (sizeof(struct s_" << Trans_Mangle(p) << ") == " << repr->size << ") ? 1 : -1 ];\n";
-                //m_of << "typedef char alignof_assert_" << Trans_Mangle(p) << "[ (ALIGNOF(struct s_" << Trans_Mangle(p) << ") == " << repr->align << ") ? 1 : -1 ];\n";
             }
+            m_of << "typedef char alignof_assert_" << Trans_Mangle(p) << "[ (ALIGNOF(struct s_" << Trans_Mangle(p) << ") == " << repr->align << ") ? 1 : -1 ];\n";
 
             m_mir_res = nullptr;
         }
@@ -2142,7 +2212,10 @@ namespace {
             emit_static_ty(type, p, /*is_proto=*/true);
             if( linkage_name != "" && m_compiler == Compiler::Gcc)
             {
-                m_of << " asm(\"" << linkage_name << "\")";
+                if (Target_GetCurSpec().m_os_name == "macos") // Not macOS only, but all Apple platforms.
+                    m_of << " asm(\"_" << linkage_name << "\")";
+                else
+                    m_of << " asm(\"" << linkage_name << "\")";
             }
             m_of << ";";
             m_of << "\t// static " << p << " : " << type;
@@ -2175,6 +2248,18 @@ namespace {
                     break;
                 }
                 break;
+            }
+            if(item.m_linkage.section != "")
+            {
+                switch(m_compiler)
+                {
+                case Compiler::Gcc:
+                    m_of << "__attribute__((section(\"" << item.m_linkage.section << "\"))) ";
+                    break;
+                case Compiler::Msvc:
+                    // Ignore section on MSVC
+                    break;
+                }
             }
             emit_static_ty(type, p, /*is_proto=*/true);
             m_of << ";";
@@ -2338,6 +2423,14 @@ namespace {
                     << "{\n"
                     ;
                 m_of << "\t"; emit_ctype(item.m_return); m_of << " rv;\n";
+
+                // MSVC needs suffixed `__builtin_{add,sub}_overflow` calls
+                const char* msvc_suffix_u32 = "";
+                if( m_compiler == Compiler::Msvc )
+                {
+                    msvc_suffix_u32 = "_u32";
+                }
+
                 // pshufb instruction w/ 128 bit operands
                 if( item.m_linkage.name == "llvm.x86.ssse3.pshuf.b.128" ) {
                     m_of
@@ -2378,18 +2471,21 @@ namespace {
                 // Add with carry
                 // `fn llvm_addcarry_u32(a: u8, b: u32, c: u32) -> (u8, u32)`
                 else if( item.m_linkage.name == "llvm.x86.addcarry.32") {
-                    m_of << "\trv._0 = __builtin_add_overflow_u32(arg1, arg2, &rv._1);\n";
-                    m_of << "\tif(arg0) rv._0 |= __builtin_add_overflow_u32(rv._1, 1, &rv._1);\n";
+                    m_of << "\trv._0 = __builtin_add_overflow" << msvc_suffix_u32 << "(arg1, arg2, &rv._1);\n";
+                    m_of << "\tif(arg0) rv._0 |= __builtin_add_overflow" << msvc_suffix_u32 << "(rv._1, 1, &rv._1);\n";
+                    m_of << "\treturn rv;\n";
                 }
                 // `fn llvm_addcarryx_u32(a: u8, b: u32, c: u32, d: *mut u8) -> u32`
                 else if( item.m_linkage.name == "llvm.x86.addcarryx.u32") {
-                    m_of << "\t*arg3 = __builtin_add_overflow_u32(arg1, arg2, rv);\n";
-                    m_of << "\tif(*arg3) *arg3 |= __builtin_add_overflow_u32(rv, 1, &rv);\n";
+                    m_of << "\t*arg3 = __builtin_add_overflow" << msvc_suffix_u32 << "(arg1, arg2, &rv);\n";
+                    m_of << "\tif(*arg3) *arg3 |= __builtin_add_overflow" << msvc_suffix_u32 << "(rv, 1, &rv);\n";
+                    m_of << "\treturn rv;\n";
                 }
-                // `fn llvm_subborrow_u32(a: u8, b: u32, c: u32) -> (u8, u32);`
+                // `fn llvm_subborrow" << msvc_suffix_u32 << "(a: u8, b: u32, c: u32) -> (u8, u32);`
                 else if( item.m_linkage.name == "llvm.x86.subborrow.32") {
-                    m_of << "\trv._0 = __builtin_sub_overflow_u32(arg1, arg2, &rv._1);\n";
-                    m_of << "\tif(arg0) rv._0 |= __builtin_sub_overflow_u32(rv._1, 1, &rv._1);\n";
+                    m_of << "\trv._0 = __builtin_sub_overflow" << msvc_suffix_u32 << "(arg1, arg2, &rv._1);\n";
+                    m_of << "\tif(arg0) rv._0 |= __builtin_sub_overflow" << msvc_suffix_u32 << "(rv._1, 1, &rv._1);\n";
+                    m_of << "\treturn rv;\n";
                 }
                 // AES functions
                 else if( item.m_linkage.name.rfind("llvm.x86.aesni.", 0) == 0 )
@@ -2399,7 +2495,7 @@ namespace {
                 else {
                     // TODO: Hand off to compiler-specific intrinsics
                     //MIR_TODO(*m_mir_res, "LLVM extern linkage: " << item.m_linkage.name);
-                    m_of << "\tassert(!\"" << item.m_linkage.name << "\"); abort();\n";
+                    m_of << "\tassert(!\"Extern LLVM: " << item.m_linkage.name << "\"); abort();\n";
                 }
                 m_of << "}\n";
                 m_mir_res = nullptr;
@@ -2433,7 +2529,10 @@ namespace {
                 switch(m_compiler)
                 {
                 case Compiler::Gcc:
-                    m_of << " asm(\"" << item.m_linkage.name << "\")";
+                    if (Target_GetCurSpec().m_os_name == "macos") // Not macOS only, but all Apple platforms.
+                        m_of << " asm(\"_" << item.m_linkage.name << "\")";
+                    else
+                        m_of << " asm(\"" << item.m_linkage.name << "\")";
                     break;
                 case Compiler::Msvc:
                     break;
@@ -2943,6 +3042,13 @@ namespace {
                 return false;
             }
         }
+        bool type_is_high_align(const ::HIR::TypeRef& ty) const
+        {
+            size_t  size, align;
+            // NOTE: Uses the Size+Align version because that doesn't panic on unsized
+            MIR_ASSERT(*m_mir_res, Target_GetSizeAndAlignOf(sp, m_resolve, ty, size, align), "Unexpected generic? " << ty);
+            return align >Target_GetPointerBits() / 8;
+        }
 
         void emit_borrow(const ::MIR::TypeResolve& mir_res, HIR::BorrowType bt, const MIR::LValue& val)
         {
@@ -3168,7 +3274,7 @@ namespace {
                     // Shallow drops are only valid on owned_box
                     if( const auto* ity = m_resolve.is_type_owned_box(ty) )
                     {
-                        emit_box_drop(1, *ity, e.slot, /*run_destructor=*/false);
+                        emit_box_drop(1, *ity, ty, e.slot, /*run_destructor=*/false);
                     }
                     else
                     {
@@ -3194,6 +3300,17 @@ namespace {
                     break;
                 case Compiler::Msvc:
                     this->emit_asm_msvc(mir_res, stmt.as_Asm(), indent_level);
+                    break;
+                }
+                break;
+            case ::MIR::Statement::TAG_Asm2:
+                switch(m_compiler)
+                {
+                case Compiler::Gcc:
+                    this->emit_asm2_gcc(mir_res, stmt, indent_level);
+                    break;
+                case Compiler::Msvc:
+                    this->emit_asm2_msvc(mir_res, stmt, indent_level);
                     break;
                 }
                 break;
@@ -3958,28 +4075,45 @@ namespace {
 
             bool has_zst = false;
             for(unsigned int j = 0; j < e.args.size(); j ++) {
+                ::HIR::TypeRef tmp;
+                const auto& ty = m_mir_res->get_param_type(tmp, e.args[j]);
                 if( m_options.disallow_empty_structs /*&& TU_TEST1(e.args[j], LValue, .is_Field())*/ )
                 {
-                    ::HIR::TypeRef tmp;
-                    const auto& ty = m_mir_res->get_param_type(tmp, e.args[j]);
                     if( this->type_is_bad_zst(ty) )
                     {
                         if(!has_zst) {
                             m_of << "{\n";
                             indent.n ++ ;
                             m_of << indent;
+                            has_zst = true;
                         }
-                        has_zst = true;
                         emit_ctype(ty, FMT_CB(ss, ss << "zarg" << j;));
                         m_of << " = {0};\n";
                         m_of << indent;
+                        continue;
                     }
+                }
+                if( e.args[j].is_Constant() && this->type_is_high_align(ty) )
+                {
+                    if(!has_zst) {
+                        m_of << "{\n";
+                        indent.n ++ ;
+                        m_of << indent;
+                        has_zst = true;
+                    }
+
+                    emit_ctype(ty, FMT_CB(ss, ss << "haarg" << j;));
+                    m_of << " = ";
+                    emit_param(e.args[j]);
+                    m_of << ";\n";
+                    m_of << indent;
+                    continue;
                 }
             }
 
             bool omit_assign = false;
 
-            // If the return type is `()`, omit the assignment (all () returning functions are marked as returning
+            // If the return type is `()`, omit the assignment (all `()` returning functions are marked as returning
             // void)
             {
                 ::HIR::TypeRef  tmp;
@@ -4084,15 +4218,21 @@ namespace {
             for(unsigned int j = 0; j < e.args.size(); j ++) {
                 if(j != 0)  m_of << ",";
                 m_of << " ";
-                if( m_options.disallow_empty_structs /*&& TU_TEST1(e.args[j], LValue, .is_Field())*/ )
+                ::HIR::TypeRef tmp;
+                const auto& ty = m_mir_res->get_param_type(tmp, e.args[j]);
+
+                if( this->type_is_high_align(ty) )
                 {
-                    ::HIR::TypeRef tmp;
-                    const auto& ty = m_mir_res->get_param_type(tmp, e.args[j]);
-                    if( this->type_is_bad_zst(ty) )
-                    {
-                        m_of << "zarg" << j;
+                    m_of << "&";
+                    if( e.args[j].is_Constant() ) {
+                        m_of << "haarg" << j;
                         continue;
                     }
+                }
+                if( this->type_is_bad_zst(ty) )
+                {
+                    m_of << "zarg" << j;
+                    continue;
                 }
                 emit_param(e.args[j]);
             }
@@ -4182,10 +4322,20 @@ namespace {
                     return ;
                 }
             }
+            if(asm_matches_template(e, "pushfd; popl $0", {}, {"=r"}))
+            {
+                m_of << indent << "__asm__ __volatile__ (\"pushfl; popl %0\" : \"=r\" ("; emit_lvalue(e.outputs[0].second); m_of << ") : : );\n";
+                return;
+            }
+            if(asm_matches_template(e, "pushl $0; popfd", {"r"}, {}))
+            {
+                m_of << indent << "__asm__ __volatile__ (\"pushl %0; popfl\" : : \"r\" ("; emit_lvalue(e.inputs[0].second); m_of << ") : );\n";
+                return;
+            }
 
             m_of << indent << "__asm__ ";
             if (is_volatile) m_of << "__volatile__";
-            m_of << "(\"" << (is_intel ? ".syntax intel; " : "");
+            m_of << "(\"" << (is_intel ? ".intel_syntax; " : "");
             // TODO: Use a more powerful parser
             for (auto it = e.tpl.begin(); it != e.tpl.end(); ++it)
             {
@@ -4216,7 +4366,7 @@ namespace {
                 else
                     m_of << *it;
             }
-            m_of << (is_intel ? ".syntax att; " : "") << "\"";
+            m_of << (is_intel ? ".att_syntax; " : "") << "\"";
             m_of << ": ";
             for (unsigned int i = 0; i < e.outputs.size(); i++)
             {
@@ -4465,13 +4615,366 @@ namespace {
             }
             m_of << ";\n";
         }
+
+        struct Asm2TplMatch {
+            const MIR::TypeResolve& m_mir_res;
+            const ::MIR::Statement& stmt;
+            const ::MIR::Statement::Data_Asm2& e;
+            std::vector<std::string>    fmt_lines;
+            std::vector<std::string>    fmt_params;
+
+            Asm2TplMatch(const MIR::TypeResolve& mir_res, const ::MIR::Statement& stmt)
+                : m_mir_res(mir_res)
+                , stmt(stmt)
+                , e(stmt.as_Asm2())
+            {
+                for(const auto& v : e.lines) {
+                    fmt_lines.push_back(FMT(FMT_CB(os, v.fmt(os))));
+                    fmt_lines.back().erase(fmt_lines.back().begin());
+                    fmt_lines.back().pop_back();
+                    DEBUG(fmt_lines.back());
+                }
+
+                for(const auto& p : e.params) {
+                    fmt_params.push_back(get_param_text(p));
+                }
+            }
+            bool matches_template(::std::initializer_list<const char*> lines, ::std::initializer_list<const char*> params) const
+            {
+                if( !check_list(fmt_lines, lines) )
+                    return false;
+
+                if( !check_list(fmt_params, params) ) {
+                    MIR_BUG(m_mir_res, "Hard-coded asm translation doesn't apply - " << stmt << "\n"
+                        << "[" << fmt_params << "] != \n[" << FMT_CB(os, for(auto it = params.begin(); it != params.end(); ++it) os << *it << ", ") << "]");
+                }
+
+                return true;
+            }
+
+            const MIR::AsmParam& p(size_t i) const {
+                return e.params.at(i);
+            }
+            const MIR::Param& input(size_t i) const {
+                MIR_ASSERT(m_mir_res, e.params.at(i).as_Reg().input, "Parameter " << i << " isn't a register input");
+                return *e.params.at(i).as_Reg().input;
+            }
+            const MIR::LValue& output(size_t i) const {
+                MIR_ASSERT(m_mir_res, e.params.at(i).as_Reg().output, "Parameter " << i << " isn't a register output");
+                return *e.params.at(i).as_Reg().output;
+            }
+
+        private:
+            /// Get a description of the parameter's important attributes
+            static std::string get_param_text(const MIR::AsmParam& p) {
+                TU_MATCH_HDRA( (p), {)
+                TU_ARMA(Reg, e) {
+                    TU_MATCH_HDRA( (e.spec), { )
+                    TU_ARMA(Explicit, n) {
+                        return FMT(get_dir_text(e.dir) << "=" << n);
+                        }
+                    TU_ARMA(Class, c) {
+                        return FMT(get_dir_text(e.dir) << ":" << AsmCommon::to_string(c));
+                        }
+                    }
+                    }
+                TU_ARMA(Const, e)
+                    return "const";
+                TU_ARMA(Sym, e)
+                    return "sym";
+                }
+                throw "";
+            }
+            static const char* get_dir_text(const AsmCommon::Direction& d) {
+                switch(d)
+                {
+                case AsmCommon::Direction::In:  return "in";
+                case AsmCommon::Direction::Out:  return "out";
+                case AsmCommon::Direction::InOut:  return "inout";
+                case AsmCommon::Direction::LateOut:  return "lateout";
+                case AsmCommon::Direction::InLateOut:  return "inlateout";
+                }
+                throw "";
+            }
+            static bool check_list(const std::vector<std::string>& have, const ::std::initializer_list<const char*>& exp) {
+                if( have.size() != exp.size() ) {
+                    return false;
+                }
+                auto h_it = have.begin();
+                auto e_it = exp.begin();
+                for(; h_it != have.end(); ++h_it, ++e_it)
+                {
+                    if( *h_it != *e_it ) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        };
+        void emit_asm2_msvc(const ::MIR::TypeResolve& mir_res, const ::MIR::Statement& stmt, unsigned indent_level)
+        {
+            auto indent = RepeatLitStr{ "\t", static_cast<int>(indent_level) };
+            Asm2TplMatch    m { mir_res, stmt };
+
+            if( stmt.as_Asm2().lines.empty() ) 
+            {
+                // Ignore?
+            }
+            // === x86 intrinsics ===
+            // - CPUID
+            else if( m.matches_template({"movq %rbx, {0:r}", "cpuid", "xchgq %rbx, {0:r}"}, {"lateout:reg","inlateout=eax","inlateout=ecx","lateout=edx"}) )
+            {
+                m_of << indent << "{";
+                m_of << " int cpuid_out[4];";
+                m_of << " __cpuidex(cpuid_out, "; emit_param(m.input(1)); m_of << ", "; emit_param(m.input(2)); m_of << ");";
+                m_of << " "; emit_lvalue(m.output(1)); m_of << " = cpuid_out[0];";  // EAX
+                m_of << " "; emit_lvalue(m.output(0)); m_of << " = cpuid_out[1];";  // EBX
+                m_of << " "; emit_lvalue(m.output(2)); m_of << " = cpuid_out[2];";  // ECX
+                m_of << " "; emit_lvalue(m.output(3)); m_of << " = cpuid_out[3];";  // EDX
+                m_of << " }\n";
+            }
+            // - EFlags
+            else if( m.matches_template({"pushfq", "pop {0}"}, {"out:reg"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(0)); m_of << " = __readeflags();\n";
+            }
+            else if( m.matches_template({"push {0}", "popfq"}, {"in:reg"}) )
+            {
+                m_of << indent << "__writeeflags("; emit_param(m.input(0)); m_of << ");\n";
+            }
+            // - Bit test (and *)
+            else if( m.matches_template({"btl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittest("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            else if( m.matches_template({"btq {1}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittest64("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            else if( m.matches_template({"btcl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittestandcomplement("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            else if( m.matches_template({"btcq {1}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittestandcomplement64("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            else if( m.matches_template({"btrl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittestandreset("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            else if( m.matches_template({"btrq {1}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittestandreset64("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            else if( m.matches_template({"btsl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittestandset("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            else if( m.matches_template({"btsq {1}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent; emit_lvalue(m.output(2));
+                m_of << " = _bittestandset64("; emit_param(m.input(0)); m_of << ","; emit_param(m.input(1)); m_of << ");\n";
+            }
+            // -- Windows intrinsics --
+            else if( m.matches_template({"int $$0x29"}, {"in=ecx"}) )
+            {
+                m_of << indent << "__fastfail("; emit_param(m.input(0)); m_of << ");\n";
+            }
+            // -- Unknown --
+            else
+            {
+                if( Target_GetCurSpec().m_backend_c.m_c_compiler == "amd64" ) {
+                    MIR_TODO(mir_res, "MSVC amd64 doesn't support inline assembly, need to have a transform for " << stmt);
+                }
+                MIR_TODO(mir_res, "Translate to MSVC");
+            }
+        }
+        void emit_asm2_gcc(const ::MIR::TypeResolve& mir_res, const ::MIR::Statement& stmt, unsigned indent_level)
+        {
+            auto indent = RepeatLitStr{ "\t", static_cast<int>(indent_level) };
+            Asm2TplMatch    m { mir_res, stmt };
+            const auto& se = stmt.as_Asm2();
+
+
+            // The following clobber overlaps with an output
+            // __asm__ ("cpuid": "=a" (var0), "=b" (var1), "=c" (var2), "=d" (var3): "a" (arg0), "c" (var4): "rbx");
+            if( m.matches_template({"movq %rbx, {0:r}", "cpuid", "xchgq %rbx, {0:r}"}, {"lateout:reg", "inlateout=eax", "inlateout=ecx", "lateout=edx"}) )
+            {
+                //if( e.clobbers.size() == 1 && e.clobbers[0] == "rbx" ) {
+                    m_of << indent << "__asm__(\"cpuid\"";
+                    m_of << " : ";
+                    m_of << "\"=a\" ("; emit_lvalue(m.output(1)); m_of << "), ";
+                    m_of << "\"=b\" ("; emit_lvalue(m.output(0)); m_of << "), ";
+                    m_of << "\"=c\" ("; emit_lvalue(m.output(2)); m_of << "), ";
+                    m_of << "\"=d\" ("; emit_lvalue(m.output(3)); m_of << ")";
+                    m_of << " : ";
+                    m_of << "\"a\" ("; emit_param(m.input(1)); m_of << "), ";
+                    m_of << "\"c\" ("; emit_param(m.input(2)); m_of << ")";
+                    m_of << " );\n";
+                    return ;
+                //}
+            }
+            else if( m.matches_template({"btl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent << "__asm__(\"bt %1, (%2); setc %0\"";
+                m_of << " : \"=r\"("; emit_lvalue(m.output(2)); m_of << ")";
+                m_of << " : \"r\"("; emit_param(m.input(0));  m_of << "), \"r\"("; emit_param(m.input(1));  m_of << ")";
+                m_of << ");\n";
+                return;
+            }
+            else if( m.matches_template({"btcl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent << "__asm__(\"btc %1, (%2); setc %0\"";
+                m_of << " : \"=r\"("; emit_lvalue(m.output(2)); m_of << ")";
+                m_of << " : \"r\"("; emit_param(m.input(0));  m_of << "), \"r\"("; emit_param(m.input(1));  m_of << ")";
+                m_of << ");\n";
+                return;
+            }
+            else if( m.matches_template({"btrl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent << "__asm__(\"btr %1, (%2); setc %0\"";
+                m_of << " : \"=r\"("; emit_lvalue(m.output(2)); m_of << ")";
+                m_of << " : \"r\"("; emit_param(m.input(0));  m_of << "), \"r\"("; emit_param(m.input(1));  m_of << ")";
+                m_of << ");\n";
+                return;
+            }
+            else if( m.matches_template({"btsl {1:e}, ({0})", "setc {2}"}, {"in:reg", "in:reg", "out:reg_byte"}) )
+            {
+                m_of << indent << "__asm__(\"bts %1, (%2); setc %0\"";
+                m_of << " : \"=r\"("; emit_lvalue(m.output(2)); m_of << ")";
+                m_of << " : \"r\"("; emit_param(m.input(0));  m_of << "), \"r\"("; emit_param(m.input(1));  m_of << ")";
+                m_of << ");\n";
+                return;
+            }
+            else
+            {
+                std::vector<unsigned>   arg_mappings(se.params.size(), UINT_MAX);
+                std::vector<const MIR::AsmParam::Data_Reg*>   outputs;
+                // Outputs
+                for(size_t i = 0; i < se.params.size(); i ++)
+                {
+                    if( const auto* pe = se.params[i].opt_Reg() ) {
+                        if( pe->output )
+                        {
+                            arg_mappings[i] = outputs.size();
+                            outputs.push_back(pe);
+                        }
+                    }
+                }
+                // Inputs
+                std::vector<const MIR::AsmParam*>   inputs;
+                for(size_t i = 0; i < se.params.size(); i ++)
+                {
+                    if( const auto* pe = se.params[i].opt_Reg() ) {
+                        if( pe->input )
+                        {
+                            arg_mappings[i] = outputs.size() + inputs.size();
+                            inputs.push_back(&se.params[i]);
+                        }
+                    }
+                }
+                // Clobbers
+                std::vector<const char*>   clobbers;
+                for(size_t i = 0; i < se.params.size(); i ++)
+                {
+                    // An explicit register, not "In" and output parameter
+                }
+
+                m_of << indent << "__asm__ ";
+                m_of << "__volatile__"; // Default everything to volatile
+                m_of << "(\".intel_syntax; ";
+                for(const auto& l : se.lines)
+                {
+                    for(const auto& f : l.frags)
+                    {
+                        m_of << FmtEscaped(f.before);
+                        //if( f.modifier != '\0' )
+                        //    MIR_TODO(mir_res, "Asm2 GCC: modifier - " << stmt);
+                        MIR_ASSERT(mir_res, arg_mappings.at(f.index) != UINT_MAX, stmt);
+                        m_of << "%" << arg_mappings.at(f.index);
+                    }
+                    m_of << FmtEscaped(l.trailing);
+                    m_of << ";\\n ";
+                }
+                m_of << ".att_syntax; \"";
+                m_of << " :";
+                for(size_t i = 0; i < outputs.size(); i ++)
+                {
+                    const auto& p = *outputs[i];
+                    if(i != 0)  m_of << ",";
+                    m_of << " ";
+                    m_of << "\"";
+                    TU_MATCH_HDRA((p.spec), {)
+                    TU_ARMA(Class, c)
+                        switch(c)
+                        {
+                        case AsmCommon::RegisterClass::x86_reg: m_of << "=r";   break;
+                        case AsmCommon::RegisterClass::x86_reg_abcd: m_of << "=Q";   break;
+                        case AsmCommon::RegisterClass::x86_reg_byte: m_of << "=q";   break;
+                        case AsmCommon::RegisterClass::x86_xmm: m_of << "=x";   break;
+                        case AsmCommon::RegisterClass::x86_ymm: m_of << "=x";   break;
+                        case AsmCommon::RegisterClass::x86_zmm: m_of << "=v";   break;
+                        case AsmCommon::RegisterClass::x86_kreg: MIR_TODO(mir_res, "Asm2 GCC - x86_kreg: " << stmt);
+                        }
+                    TU_ARMA(Explicit, name) {
+                        MIR_TODO(mir_res, "Asm2 GCC - Explicit output reg: " << stmt);
+                        }
+                    }
+                    assert(p.output);
+                    m_of << "\" ("; emit_lvalue(*p.output); m_of << ")";
+                }
+                m_of << " :";
+                for(size_t i = 0; i < inputs.size(); i ++)
+                {
+                    const auto& p = *inputs[i];
+                    if(i != 0)  m_of << ",";
+                    m_of << " ";
+                    TU_MATCH_HDRA((p), {)
+                    TU_ARMA(Reg, r) {
+                        m_of << "\"";
+                        TU_MATCH_HDRA((r.spec), {)
+                        TU_ARMA(Class, c)
+                            switch(c)
+                            {
+                            case AsmCommon::RegisterClass::x86_reg: m_of << "r";   break;
+                            case AsmCommon::RegisterClass::x86_reg_abcd: m_of << "Q";   break;
+                            case AsmCommon::RegisterClass::x86_reg_byte: m_of << "q";   break;
+                            case AsmCommon::RegisterClass::x86_xmm: m_of << "x";   break;
+                            case AsmCommon::RegisterClass::x86_ymm: m_of << "x";   break;
+                            case AsmCommon::RegisterClass::x86_zmm: m_of << "v";   break;
+                            case AsmCommon::RegisterClass::x86_kreg: MIR_TODO(mir_res, "Asm2 GCC - x86_kreg: " << stmt);
+                            }
+                        TU_ARMA(Explicit, name) {
+                            MIR_TODO(mir_res, "Asm2 GCC - Explicit output reg: " << stmt);
+                            }
+                        }
+                        assert(r.input);
+                        m_of << "\" ("; emit_param(*r.input); m_of << ")";
+                        }
+                    TU_ARMA(Const, c)   MIR_TODO(mir_res, "Asm2 GCC - Const: " << stmt);
+                    TU_ARMA(Sym, c)   MIR_TODO(mir_res, "Asm2 GCC - Sym: " << stmt);
+                    }
+                }
+                m_of << ");\n";
+            }
+        }
     private:
         const ::HIR::TypeRef& monomorphise_fcn_return(::HIR::TypeRef& tmp, const ::HIR::Function& item, const Trans_Params& params)
         {
-            if( visit_ty_with(item.m_return, [&](const auto& x){ return x.data().is_ErasedType() || x.data().is_Generic(); }) )
+            bool has_erased = visit_ty_with(item.m_return, [&](const auto& x) { return x.data().is_ErasedType(); });
+            
+            if( has_erased || monomorphise_type_needed(item.m_return) )
             {
                 // If there's an erased type, make a copy with the erased type expanded
-                if( visit_ty_with(item.m_return, [&](const auto& x) { return x.data().is_ErasedType(); }) )
+                if( has_erased )
                 {
                     tmp = clone_ty_with(sp, item.m_return, [&](const auto& x, auto& out) {
                         if( const auto* te = x.data().opt_ErasedType() ) {
@@ -4518,7 +5021,9 @@ namespace {
                     {
                         if( i != 0 )    m_of << ",";
                         ss << "\n\t\t";
-                        this->emit_ctype( params.monomorph(m_resolve, item.m_args[i].second), FMT_CB(os, os << "arg" << i;) );
+                        // TODO: If the type has a high alignment, emit as a pointer
+                        auto ty = params.monomorph(m_resolve, item.m_args[i].second);
+                        this->emit_ctype( ty, FMT_CB(os, os << (this->type_is_high_align(ty) ? "*":"") << "arg" << i;) );
                     }
 
                     if( item.m_variadic )
@@ -4588,12 +5093,18 @@ namespace {
                     else if( ::std::strcmp(suffix, "acqrel") == 0 ) {
                         return Ordering::AcqRel;
                     }
+                    // TODO: Is this correct?
+                    else if( ::std::strcmp(suffix, "unordered") == 0 ) {
+                        return Ordering::Relaxed;
+                    }
                     else {
                         MIR_BUG(mir_res, "Unknown atomic ordering suffix - '" << suffix << "'");
                     }
                     throw "";
                 };
             auto get_prim_size = [&mir_res](const ::HIR::TypeRef& ty)->unsigned {
+                    if(ty.data().is_Pointer())
+                        return Target_GetCurSpec().m_arch.m_pointer_bits;
                     if( !ty.data().is_Primitive() )
                         MIR_BUG(mir_res, "Unknown type for getting primitive size - " << ty);
                     switch( ty.data().as_Primitive() )
@@ -4641,22 +5152,22 @@ namespace {
                 }
                 };
             auto emit_msvc_atomic_op = [&](const char* name, Ordering ordering) {
+                const auto& ty = params.m_types.at(0);
+                if(ty.data().is_Pointer()) {
+                    m_of << "("; emit_ctype(ty); m_of << ")";
+                }
                 m_of << name;
-                switch( get_real_prim_ty(params.m_types.at(0).data().as_Primitive()) )
+                switch( get_prim_size(params.m_types.at(0)) )
                 {
-                case ::HIR::CoreType::U8:
-                case ::HIR::CoreType::I8:
+                case 8:
                     m_of << "8";
                     break;
-                case ::HIR::CoreType::U16:
-                case ::HIR::CoreType::I16:
+                case 16:
                     m_of << "16";
                     break;
-                case ::HIR::CoreType::U32:
-                case ::HIR::CoreType::I32:
+                case 32:
                     break;
-                case ::HIR::CoreType::U64:
-                case ::HIR::CoreType::I64:
+                case 64:
                     m_of << "64";
                     break;
                 default:
@@ -4664,9 +5175,12 @@ namespace {
                 }
                 m_of << get_atomic_suffix_msvc(ordering);
                 m_of << "(";
+                if(ty.data().is_Pointer()) {
+                    m_of << "(uintptr_t*)";
+                }
                 };
             auto emit_atomic_cast = [&]() {
-                m_of << "(_Atomic "; emit_ctype(params.m_types.at(0)); m_of << "*)";
+                m_of << "("; emit_ctype(params.m_types.at(0)); m_of << "_Atomic *)";
                 };
             auto emit_atomic_cxchg = [&](const auto& e, Ordering o_succ, Ordering o_fail, bool is_weak) {
                 switch(m_compiler)
@@ -4694,7 +5208,9 @@ namespace {
                     emit_lvalue(e.ret_val); m_of << "._0 = ";
                     emit_msvc_atomic_op("InterlockedCompareExchange", Ordering::SeqCst);  // TODO: Use ordering, but which one?
                     // Slot, Exchange (new value), Comparand (expected value) - Note different order to the gcc/stdc version
-                    emit_param(e.args.at(0)); m_of << ", "; emit_param(e.args.at(2)); m_of << ", "; emit_param(e.args.at(1)); m_of << ")";
+                    emit_param(e.args.at(0)); m_of << ", ";
+                    if(params.m_types.at(0).data().is_Pointer()) { m_of << "(uintptr_t)"; } emit_param(e.args.at(2)); m_of << ", ";
+                    if(params.m_types.at(0).data().is_Pointer()) { m_of << "(uintptr_t)"; } emit_param(e.args.at(1)); m_of << ")";
                     m_of << ";\n\t";
                     // If the result equals the expected value, return true
                     emit_lvalue(e.ret_val); m_of << "._1 = ("; emit_lvalue(e.ret_val); m_of << "._0 == "; emit_param(e.args.at(1)); m_of << ")";
@@ -4855,9 +5371,17 @@ namespace {
                 }
                 #endif
             }
-            else if( name == "panic_if_uninhabited" ) {
-                // TODO: Detect uninhabited (empty enum, or containing that)
+            // --- Type assertions ---
+            else if( name == "panic_if_uninhabited" || name == "assert_inhabited" ) {
+                // TODO: Detect uninhabited (empty enum or `!` - potentially via nested types)
             }
+            else if( name == "assert_zero_valid" ) {
+                // TODO: Detect nonzero within
+            }
+            else if( name == "assert_uninit_valid" ) {
+                // TODO: Detect nonzero or enum within
+            }
+            // --- Type identity ---
             else if( name == "type_id" ) {
                 const auto& ty = params.m_types.at(0);
                 // NOTE: Would define the typeid here, but it has to be public
@@ -4886,12 +5410,12 @@ namespace {
                 {
                     auto src_meta = metadata_type(ty_src.data().is_Pointer() ? ty_src.data().as_Pointer().inner : ty_src.data().as_Borrow().inner);
                     auto dst_meta = metadata_type(ty_dst.data().is_Pointer() ? ty_dst.data().as_Pointer().inner : ty_dst.data().as_Borrow().inner);
-                    if( src_meta == MetadataType::None )
+                    if( src_meta == MetadataType::None || src_meta == MetadataType::Zero )
                     {
-                        MIR_ASSERT(*m_mir_res, dst_meta == MetadataType::None, "Transmuting to fat pointer from thin: " << ty_src << " -> " << ty_dst);
+                        MIR_ASSERT(*m_mir_res, dst_meta == MetadataType::None || dst_meta == MetadataType::Zero, "Transmuting to fat pointer from thin: " << ty_src << " -> " << ty_dst);
                         emit_lvalue(e.ret_val); m_of << " = (void*)"; emit_param(e.args.at(0));
                     }
-                    else if(dst_meta == MetadataType::None)
+                    else if(dst_meta == MetadataType::None || dst_meta == MetadataType::Zero)
                     {
                         MIR_BUG(*m_mir_res, "Transmuting from fat pointer to thin: (" << src_meta << "->" << dst_meta << ") " << ty_src << " -> " << ty_dst);
                     }
@@ -4917,6 +5441,17 @@ namespace {
                 else
                 {
                     m_of << "memcpy( &"; emit_lvalue(e.ret_val); m_of << ", &"; emit_param(e.args.at(0)); m_of << ", sizeof("; emit_ctype(ty_src); m_of << "))";
+                }
+            }
+            else if( name == "float_to_int_unchecked" ) {
+                const auto& dst_ty = params.m_types.at(1);
+                // Unchecked (can return `undef`) cast from a float to an integer
+                if( this->type_is_emulated_i128(dst_ty) ) {
+                    m_of << "abort()";
+                    //emit_lvalue(e.ret_val); m_of << " = ("; emit_ctype(dst_ty); m_of << ")"; emit_param(e.args.at(0));
+                }
+                else {
+                    emit_lvalue(e.ret_val); m_of << " = ("; emit_ctype(dst_ty); m_of << ")"; emit_param(e.args.at(0));
                 }
             }
             else if( name == "copy_nonoverlapping" || name == "copy" ) {
@@ -4954,6 +5489,7 @@ namespace {
             else if( name == "drop_in_place" ) {
                 emit_destructor_call( ::MIR::LValue::new_Deref(e.args.at(0).as_LValue().clone()), params.m_types.at(0), true, /*indent_level=*/1 /* TODO: get from caller */ );
             }
+            // --- Type traits
             else if( name == "needs_drop" ) {
                 // Returns `true` if the actual type given as `T` requires drop glue;
                 // returns `false` if the actual type provided for `T` implements `Copy`. (Either otherwise)
@@ -4968,6 +5504,7 @@ namespace {
                     m_of << "false";
                 }
             }
+            // --- Initialisation (or lack thereof)
             else if( name == "uninit" ) {
                 // Do nothing, leaves the destination undefined
                 // TODO: This makes the C compiler warn
@@ -4993,7 +5530,12 @@ namespace {
                     m_of << " jmp_buf jmpbuf, *old = mrustc_panic_target; mrustc_panic_target = &jmpbuf;";
                     m_of << " if(setjmp(jmpbuf)) {";
                     // NOTE: gcc unwind has a pointer as its `local_ptr` parameter
-                    m_of << " *(void**)("; emit_param(e.args.at(2)); m_of << ") = mrustc_panic_value;";
+                    if(TARGETVER_MOST_1_39) {
+                        m_of << " *(void**)("; emit_param(e.args.at(2)); m_of << ") = mrustc_panic_value;";
+                    }
+                    else {
+                        m_of << "("; emit_param(e.args.at(2)); m_of << ")("; emit_param(e.args.at(1)); m_of << ", mrustc_panic_value);";
+                    }
                     m_of << " "; emit_lvalue(e.ret_val); m_of << " = 1;";   // Return value non-zero when panic happens
                     m_of << " } else {";
                     m_of << " ";
@@ -5016,12 +5558,29 @@ namespace {
                     break;
                 }
             }
-            else if( name == "offset" ) {
+            // --- #[track_caller]
+            else if( name == "caller_location" ) {
+                //m_of << "abort()";
+                m_of << "static struct s_ZRG2cE9core0_0_05panic8Location0g mrustc_empty_caller_location = {0,0,{\"\",0}};";
+                emit_lvalue(e.ret_val); m_of << " = &mrustc_empty_caller_location"; // TODO: Hidden ABI for caller location
+            }
+            // --- Pointer manipulation
+            else if( name == "offset" ) {   // addition, with the reqirement that the resultant pointer be in bounds
                 emit_lvalue(e.ret_val); m_of << " = "; emit_param(e.args.at(0)); m_of << " + "; emit_param(e.args.at(1));
             }
-            else if( name == "arith_offset" ) {
+            else if( name == "arith_offset" ) { // addition, with no requirements
                 emit_lvalue(e.ret_val); m_of << " = "; emit_param(e.args.at(0)); m_of << " + "; emit_param(e.args.at(1));
             }
+            else if( name == "ptr_offset_from" ) {  // effectively subtraction
+                emit_lvalue(e.ret_val); m_of << " = "; emit_param(e.args.at(0)); m_of << " - "; emit_param(e.args.at(1));
+            }
+            else if( name == "ptr_guaranteed_eq" ) {
+                emit_lvalue(e.ret_val); m_of << " = ("; emit_param(e.args.at(0)); m_of << " == "; emit_param(e.args.at(1)); m_of << ")";
+            }
+            else if( name == "ptr_guaranteed_ne" ) {
+                emit_lvalue(e.ret_val); m_of << " = ("; emit_param(e.args.at(0)); m_of << " != "; emit_param(e.args.at(1)); m_of << ")";
+            }
+            // ----
             else if( name == "bswap" ) {
                 const auto& ty = params.m_types.at(0);
                 MIR_ASSERT(mir_res, ty.data().is_Primitive(), "Invalid type passed to bwsap, must be a primitive, got " << ty);
@@ -5413,7 +5972,7 @@ namespace {
                 }
 #endif
             }
-            else if( name == "overflowing_mul" || name == "wrapping_mul" ) {
+            else if( name == "overflowing_mul" || name == "wrapping_mul" || name == "unchecked_mul" ) {
                 if(m_options.emulated_i128 && params.m_types.at(0) == ::HIR::CoreType::U128)
                 {
                     m_of << "mul128_o";
@@ -5658,7 +6217,7 @@ namespace {
                     m_of << ");";
                     return ;
                 }
-                else if( ty == ::HIR::CoreType::U64 || (ty == ::HIR::CoreType::Usize /*&& target_is_64_bit */) )
+                else if( ty == ::HIR::CoreType::U64 || (ty == ::HIR::CoreType::Usize && Target_GetPointerBits() > 32) )
                 {
                     emit_param(e.args.at(0)); m_of << " != 0 ? ";
                     if( name == "ctlz" || name == "ctlz_nonzero" ) {
@@ -5787,7 +6346,7 @@ namespace {
                 auto ordering = get_atomic_ordering(name, 7+4+1);
                 const auto& ty = params.m_types.at(0);
                 emit_lvalue(e.ret_val); m_of << " = __mrustc_atomicloop" << get_prim_size(ty) << "(";
-                    m_of << "(volatile "; emit_ctype(ty); m_of << "*)";
+                    m_of << "(volatile uint" << get_prim_size(ty) << "_t*)";
                     emit_param(e.args.at(0)); m_of << ", "; emit_param(e.args.at(1));
                     if( m_compiler == Compiler::Gcc )
                     {
@@ -5810,7 +6369,7 @@ namespace {
                 const auto& ty = params.m_types.at(0);
                 const char* op = (name.c_str()[7+1] == 'a' ? "imax" : "imin");    // m'a'x vs m'i'n
                 emit_lvalue(e.ret_val); m_of << " = __mrustc_atomicloop" << get_prim_size(ty) << "(";
-                    m_of << "(volatile "; emit_ctype(ty); m_of << "*)";
+                    m_of << "(volatile uint" << get_prim_size(ty) << "_t*)";
                     emit_param(e.args.at(0)); m_of << ", "; emit_param(e.args.at(1));
                     if( m_compiler == Compiler::Gcc )
                     {
@@ -5825,7 +6384,7 @@ namespace {
                 const auto& ty = params.m_types.at(0);
                 const char* op = (name.c_str()[7+2] == 'a' ? "umax" : "umin");    // m'a'x vs m'i'n
                 emit_lvalue(e.ret_val); m_of << " = __mrustc_atomicloop" << get_prim_size(ty) << "(";
-                    m_of << "(volatile "; emit_ctype(ty); m_of << "*)";
+                    m_of << "(volatile uint" << get_prim_size(ty) << "_t*)";
                     emit_param(e.args.at(0)); m_of << ", "; emit_param(e.args.at(1));
                     if( m_compiler == Compiler::Gcc )
                     {
@@ -5921,7 +6480,7 @@ namespace {
                         ordering = Ordering::SeqCst;
                     emit_msvc_atomic_op("InterlockedExchange", ordering);
                     emit_param(e.args.at(0)); m_of << ", ";
-                    emit_param(e.args.at(1)); m_of << ")";
+                    if(params.m_types.at(0).data().is_Pointer()) { m_of << "(uintptr_t)"; } emit_param(e.args.at(1)); m_of << ")";
                     break;
                 }
             }
@@ -5942,7 +6501,7 @@ namespace {
             }
             // -- stdarg --
             else if( name == "va_copy" ) {
-                m_of << "va_copy("; emit_param(e.args.at(0)); m_of << ", "; emit_param(e.args.at(1)); m_of << ")";
+                m_of << "va_copy( *(va_list*)&"; emit_param(e.args.at(0)); m_of << ", *(va_list*)&"; emit_param(e.args.at(1)); m_of << ")";
             }
             // -- Platform Intrinsics --
             else if( name.compare(0, 9, "platform:") == 0 ) {
@@ -6312,7 +6871,14 @@ namespace {
                 m_of << "rv";
                 }
             TU_ARMA(Argument, e) {
-                m_of << "arg" << e;
+                if(this->type_is_high_align(m_mir_res->m_args[e].second)) {
+                    m_of << "(*";
+                    m_of << "arg" << e;
+                    m_of << ")";
+                }
+                else {
+                    m_of << "arg" << e;
+                }
                 }
             TU_ARMA(Local, e) {
                 if( e == ::MIR::LValue::Storage::MAX_ARG )
@@ -6599,7 +7165,7 @@ namespace {
                 case ::HIR::CoreType::F32: m_of << "float"; break;
                 case ::HIR::CoreType::F64: m_of << "double"; break;
 
-                case ::HIR::CoreType::Bool: m_of << "bool"; break;
+                case ::HIR::CoreType::Bool: m_of << "RUST_BOOL"; break;
                 case ::HIR::CoreType::Char: m_of << "RUST_CHAR";  break;
                 case ::HIR::CoreType::Str:
                     MIR_BUG(*m_mir_res, "Raw str");

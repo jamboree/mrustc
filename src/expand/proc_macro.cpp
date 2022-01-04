@@ -14,6 +14,7 @@
 #include <hir/hir.hpp>  // ABI_RUST
 #include "proc_macro.hpp"
 #include <parse/lex.hpp>
+#include <parse/ttstream.hpp>
 #ifdef _WIN32
 # define NOMINMAX
 # define NOGDI  // Don't include GDI functions (defines some macros that collide with mrustc ones)
@@ -43,16 +44,25 @@ public:
         if( !i.is_Function() )
             TODO(sp, "Error for proc_macro_derive on non-Function");
 
-        auto trait_name = attr.items().at(0).name();
         ::std::vector<::std::string>    attributes;
-        for(size_t i = 1; i < attr.items().size(); i ++)
+        TTStream    lex(sp, ParseState(), attr.data());
+        lex.getTokenCheck(TOK_PAREN_OPEN);
+        auto trait_name = lex.getTokenCheck(TOK_IDENT).ident().name;
+        while(lex.getTokenIf(TOK_COMMA))
         {
-            if( attr.items()[i].name() == "attributes") {
-                for(const auto& si : attr.items()[i].items()) {
-                    attributes.push_back( si.name().as_trivial().c_str() );
-                }
+            auto k = lex.getTokenCheck(TOK_IDENT).ident().name;
+            if( k == "attributes" ) {
+                lex.getTokenCheck(TOK_PAREN_OPEN);
+                do {
+                    attributes.push_back( lex.getTokenCheck(TOK_IDENT).ident().name.c_str() );
+                } while(lex.getTokenIf(TOK_COMMA));
+                lex.getTokenCheck(TOK_PAREN_CLOSE);
+            }
+            else {
+                ERROR(sp, E0000, "Unexpected `" << k << "` in `#[proc_macro_derive]`");
             }
         }
+        lex.getTokenCheck(TOK_PAREN_CLOSE);
 
         crate.m_proc_macros.push_back(AST::ProcMacroDef { RcString::new_interned(FMT(trait_name)), path, mv$(attributes) });
     }
@@ -80,7 +90,8 @@ STATIC_DECORATOR("proc_macro", Decorator_ProcMacro)
 
 void Expand_ProcMacro(::AST::Crate& crate)
 {
-    crate.load_extern_crate(Span(), "proc_macro");
+    auto pm_crate_name = RcString::new_interned("proc_macro");
+    AST::g_implicit_crates.insert( std::make_pair(pm_crate_name, crate.load_extern_crate(Span(), pm_crate_name)) );
 
     // Create the following module:
     // ```
@@ -178,6 +189,7 @@ struct ProcMacroInv:
 {
     Span    m_parent_span;
     const ::HIR::ProcMacro& m_proc_macro_desc;
+    AST::Edition    m_edition;
     ::std::ofstream m_dump_file_out;
     ::std::ofstream m_dump_file_res;
 
@@ -290,6 +302,7 @@ public:
 
     virtual Position getPosition() const override;
     virtual Token realGetToken() override;
+    virtual AST::Edition realGetEdition() const override { return m_edition; }
     virtual Ident::Hygiene realGetHygiene() const override;
 private:
     Token realGetToken_();
@@ -343,7 +356,9 @@ ProcMacroInv ProcMacro_Invoke_int(const Span& sp, const ::AST::Crate& crate, con
     ::std::string   proc_macro_exe_name = ext_crate.m_filename;
 
     // 3. Create ProcMacroInv
-    return ProcMacroInv(sp, crate.m_edition, proc_macro_exe_name.c_str(), *pmp);
+    auto rv = ProcMacroInv(sp, crate.m_edition, proc_macro_exe_name.c_str(), *pmp);
+    rv.parse_state().crate = &crate;
+    return rv;
 
     // NOTE: 1.39 failure_derive (2015) emits `::failure::foo` but `libcargo` doesn't have `failure` in root (it's a 2018 crate)
     //return ProcMacroInv(sp, ext_crate.m_hir->m_edition, proc_macro_exe_name.c_str(), *pmp);
@@ -706,6 +721,12 @@ namespace {
                             this->visit_type(t);
                             m_pmi.send_symbol(",");
                             }
+                        TU_ARMA(Value, n) {
+                            m_pmi.send_symbol("{");
+                            this->visit_node(*n);
+                            m_pmi.send_symbol("}");
+                            m_pmi.send_symbol(",");
+                            }
                         TU_ARMA(AssociatedTyEqual, a) {
                             m_pmi.send_ident(a.first.c_str());
                             m_pmi.send_symbol("=");
@@ -730,21 +751,62 @@ namespace {
             {
                 bool is_first = true;
                 m_pmi.send_symbol("<");
-                for( const auto& p : params.m_params )
+                for( const auto& param : params.m_params )
                 {
                     if( !is_first )
                         m_pmi.send_symbol(",");
-                    TU_MATCH_HDRA( (p), {)
+                    TU_MATCH_HDRA( (param), {)
                     TU_ARMA(None, p) {
                         // Uh... oops?
                         BUG(Span(), "Enountered GenericParam::None");
                         }
                     TU_ARMA(Lifetime, p) {
                         m_pmi.send_lifetime(p.name().name.c_str());
+                        bool first = true;
+                        for(size_t i = param.bounds_start; i < param.bounds_end; i++) {
+                            if(!params.m_bounds[i].is_None()) {
+                                if(first) { m_pmi.send_symbol(":"); first = false; }
+                                else { m_pmi.send_symbol("+"); }
+                            }
+                            TU_MATCH_HDRA((params.m_bounds[i]), {)
+                            default:
+                                BUG(Span(), "");
+                            TU_ARMA(None, be) {}
+                            TU_ARMA(Lifetime, be) {
+                                m_pmi.send_lifetime(be.test.name().name.c_str());
+                                }
+                            }
+                        }
                         }
                     TU_ARMA(Type, p) {
                         this->visit_attrs(p.attrs());
                         m_pmi.send_ident(p.name().c_str());
+                        bool first = true;
+                        for(size_t i = param.bounds_start; i < param.bounds_end; i++) {
+                            if(!params.m_bounds[i].is_None()) {
+                                if(first) { m_pmi.send_symbol(":"); first = false; }
+                                else { m_pmi.send_symbol("+"); }
+                            }
+                            TU_MATCH_HDRA((params.m_bounds[i]), {)
+                            default:
+                                BUG(Span(), "");
+                            TU_ARMA(None, be) {}
+                            TU_ARMA(Lifetime, be) {
+                                m_pmi.send_lifetime(be.test.name().name.c_str());
+                                }
+                            TU_ARMA(IsTrait, be) {
+                                assert(be.outer_hrbs.empty());  // Shouldn't be possible in this position
+                                if( !be.inner_hrbs.empty() ) {
+                                    TODO(Span(), "be.inner_hrbs");
+                                }
+                                visit_path(be.trait);
+                                }
+                            TU_ARMA(MaybeTrait, be) {
+                                m_pmi.send_symbol("?");
+                                visit_path(be.trait);
+                                }
+                            }
+                        }
                         if( !p.get_default().is_wildcard() )
                         {
                             m_pmi.send_symbol("=");
@@ -757,6 +819,7 @@ namespace {
                         m_pmi.send_ident(p.name().name.c_str());
                         m_pmi.send_symbol(":");
                         visit_type(p.type());
+                        assert(param.bounds_start == param.bounds_end);
                         }
                     }
                     is_first = false;
@@ -768,8 +831,63 @@ namespace {
         {
             if( !params.m_bounds.empty() )
             {
-                // TODO:
-                TODO(Span(), "visit_bounds");
+                m_pmi.send_ident("where");
+
+                for(const auto& e : params.m_bounds)
+                {
+                    auto i = &e - params.m_bounds.data();
+                    bool already_emitted = false;
+                    for(const auto& p : params.m_params) {
+                        if(p.is_None())
+                            continue ;
+                        if( p.bounds_start <= i && i < p.bounds_end )
+                            already_emitted = true;
+                    }
+                    if(already_emitted)
+                        continue ;
+                    TU_MATCH_HDRA((e), {)
+                    TU_ARMA(None, be)   continue;
+                    TU_ARMA(Lifetime, be) {
+                        m_pmi.send_lifetime(be.bound.name().name.c_str());
+                        m_pmi.send_symbol(":");
+                        m_pmi.send_lifetime(be.test.name().name.c_str());
+                        }
+                    TU_ARMA(TypeLifetime, be) {
+                        visit_type(be.type);
+                        m_pmi.send_symbol(":");
+                        m_pmi.send_lifetime(be.bound.name().name.c_str());
+                        }
+                    TU_ARMA(IsTrait, be) {
+                        if( !be.outer_hrbs.empty() ) {
+                            TODO(Span(), "be.inner_hrbs");
+                        }
+                        visit_type(be.type);
+                        m_pmi.send_symbol(":");
+                        if( !be.inner_hrbs.empty() ) {
+                            TODO(Span(), "be.inner_hrbs");
+                        }
+                        visit_path(be.trait);
+                        }
+                    TU_ARMA(MaybeTrait, be) {
+                        visit_type(be.type);
+                        m_pmi.send_symbol(":");
+                        m_pmi.send_symbol("?");
+                        visit_path(be.trait);
+                        }
+                    TU_ARMA(NotTrait, be) {
+                        visit_type(be.type);
+                        m_pmi.send_symbol(":");
+                        m_pmi.send_symbol("!");
+                        visit_path(be.trait);
+                        }
+                    TU_ARMA(Equality, be) {
+                        visit_type(be.type);
+                        m_pmi.send_symbol("=");
+                        visit_type(be.replacement);
+                        }
+                    }
+                    m_pmi.send_symbol(",");
+                }
             }
         }
         void visit_node(const ::AST::ExprNode& e)
@@ -796,6 +914,9 @@ namespace {
             TODO(sp, "ExprNode_Macro");
         }
         void visit(::AST::ExprNode_Asm& node) {
+            TODO(sp, "ExprNode_Asm");
+        }
+        void visit(::AST::ExprNode_Asm2& node) {
             TODO(sp, "ExprNode_Asm");
         }
         void visit(::AST::ExprNode_Flow& node) {
@@ -857,7 +978,7 @@ namespace {
             TODO(sp, "ExprNode_Tuple");
         }
         void visit(::AST::ExprNode_NamedValue& node) {
-            TODO(sp, "ExprNode_NamedValue");
+            this->visit_path(node.m_path, true);
         }
 
         void visit(::AST::ExprNode_Field& node) {
@@ -919,25 +1040,7 @@ namespace {
                 m_pmi.send_ident(e.c_str());
             }
 
-            if( i.has_noarg() ) {
-            }
-            else if( i.has_string() ) {
-                m_pmi.send_symbol("=");
-                m_pmi.send_string( i.string().c_str() );
-            }
-            else {
-                assert(i.has_sub_items());
-                m_pmi.send_symbol("(");
-                bool first = true;
-                for(const auto& si : i.items())
-                {
-                    if(!first)
-                        m_pmi.send_symbol(",");
-                    this->visit_meta_item(si);
-                    first = false;
-                }
-                m_pmi.send_symbol(")");
-            }
+            visit_tokentree(i.data());
         }
 
         void visit_struct(const ::std::string& name, bool is_pub, const ::AST::Struct& str)
@@ -1102,7 +1205,8 @@ namespace {
 }
 
 ProcMacroInv::ProcMacroInv(const Span& sp, AST::Edition edition, const char* executable, const ::HIR::ProcMacro& proc_macro_desc):
-    TokenStream(ParseState(edition)),
+    TokenStream(ParseState()),
+    m_edition(edition),
     m_parent_span(sp),
     m_proc_macro_desc(proc_macro_desc)
 {
@@ -1160,6 +1264,7 @@ ProcMacroInv::ProcMacroInv(const Span& sp, AST::Edition edition, const char* exe
     PROCESS_INFORMATION piProcInfo{};
     STARTUPINFO siStartInfo{};
     siStartInfo.cb = sizeof(STARTUPINFO);
+    siStartInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     siStartInfo.hStdOutput = stdout_write;
     siStartInfo.hStdInput = stdin_read;
     siStartInfo.dwFlags |= STARTF_USESTDHANDLES;

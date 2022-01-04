@@ -44,8 +44,6 @@ namespace {
         {
             TRACE_FUNCTION_F(path << " in " << base_path << (ignore_last ? " (ignore last)" : ""));
             const auto& base_nodes = base_path.nodes();
-            int node_offset = 0;
-            const AST::Module*  mod = nullptr;
             TU_MATCH_HDRA( (path.m_class), {)
             TU_ARMA(Invalid, e) {
                 // Should never happen
@@ -123,6 +121,10 @@ namespace {
                         }
                     TU_ARMA(Hir, i_ent_ptr) {
                         ASSERT_BUG(sp, !i_ent_ptr->is_Import(), "");
+                        if(i_ent_ptr->is_Enum()) {
+                            DEBUG("Enum");
+                            return ResolveModuleRef();
+                        }
 
                         //if( const auto* imp = i.ent.opt_Import() ) {
                         //    ASSERT_BUG(sp, imp->path.m_components.empty(), "Expected crate path, got " << imp->path);
@@ -146,7 +148,7 @@ namespace {
                 if( crate.m_edition >= AST::Edition::Rust2018 )
                 {
                     DEBUG("Trying implicit externs for " << name);
-                    DEBUG(FmtLambda([&](std::ostream& os) { for(const auto& v : crate.m_extern_crates) os << " " << v.first;}));
+                    DEBUG(FmtLambda([&](std::ostream& os) { for(const auto& v : AST::g_implicit_crates) os << " " << v.first;}));
                     auto ec_it = AST::g_implicit_crates.find(name);
                     if(ec_it != AST::g_implicit_crates.end())
                     {
@@ -195,8 +197,25 @@ namespace {
                 }
             TU_ARMA(Absolute, e) {
                 DEBUG("Absolute " << path);
-                if( e.crate == "" || e.crate == crate.m_crate_name ) {
+                if( e.crate == "" || e.crate == crate.m_crate_name_real ) {
+                    DEBUG("Current crate");
                     return get_module_ast(crate.m_root_module, path, 0, ignore_last, out_path);
+                }
+                // 2018 `::cratename::` paths
+                else if( e.crate.c_str()[0] == '=' ) {
+                    const char* n = e.crate.c_str()+1;
+                    if( n == crate.m_crate_name_set) {
+                        return get_module_ast(crate.m_root_module, path, 0, ignore_last, out_path);
+                    }
+                    auto ec_it = AST::g_implicit_crates.find(n);
+                    if(ec_it == AST::g_implicit_crates.end())
+                        return ResolveModuleRef();
+                    auto ec_it2 = crate.m_extern_crates.find(ec_it->second);
+                    if( ec_it2 == crate.m_extern_crates.end() ) {
+                        DEBUG("Crate " << ec_it->second << " not found");
+                        return ResolveModuleRef();
+                    }
+                    return get_module_hir(ec_it2->second.m_hir->m_root_module, path, 0, ignore_last, out_path);
                 }
                 else {
                     // HIR lookup (different)
@@ -268,6 +287,9 @@ namespace {
                             return ResolveModuleRef();
                             }
                         TU_ARMA(Trait, _e) {
+                            return ResolveModuleRef();
+                            }
+                        TU_ARMA(TraitAlias, _e) {
                             return ResolveModuleRef();
                             }
                         TU_ARMA(Type, _e) {
@@ -402,6 +424,7 @@ namespace {
             case AST::Item::TAG_Enum:
             case AST::Item::TAG_Union:
             case AST::Item::TAG_Trait:
+            case AST::Item::TAG_TraitAlias:
                 return ns == ResolveNamespace::Namespace;
             case AST::Item::TAG_Struct:
                 return ns == ResolveNamespace::Namespace || (ns == ResolveNamespace::Value && !i.as_Struct().m_data.is_Struct());
@@ -489,6 +512,9 @@ namespace {
                     switch(ns)
                     {
                     case ResolveNamespace::Macro:
+                        if(const auto* mac = i->data.opt_Macro()) {
+                            return ResolveItemRef_Macro(&**mac);
+                        }
                         DEBUG("- Ignoring macro");
                         break;
                     case ResolveNamespace::Namespace:
@@ -596,11 +622,24 @@ namespace {
                     }
                 }
             }
-            DEBUG("Not found");
             if( mod.is_anon() )
             {
-                // TODO: Search parent
+                DEBUG("Recurse to parent");
+                const AST::Module* m = &crate.m_root_module;
+                for(size_t i = 0; i < mod.path().nodes.size() - 1; i ++)
+                {
+                    auto& tgt_name = mod.path().nodes[i];
+                    if( tgt_name.c_str()[0] == '#' ) {
+                        auto idx = strtol(tgt_name.c_str()+1, nullptr, 10);
+                        m = &*m->anon_mods()[idx];
+                    }
+                    else {
+                        m = &as_Namespace(this->find_item(*m, tgt_name, ResolveNamespace::Namespace)).as_Ast()->as_Module();
+                    }
+                }
+                return find_item(*m, name, ns, out_path);
             }
+            DEBUG("Not found");
             return ResolveItemRef::make_None({});
         }
 
@@ -743,12 +782,14 @@ ResolveItemRef_Macro Resolve_Lookup_Macro(const Span& span, const AST::Crate& cr
         auto rv = rs.find_item(*mod_ptr, item_name, ResolveNamespace::Macro, out_path);
         if( rv.is_None() )
             return ResolveItemRef_Macro::make_None({});
+        ASSERT_BUG(span, rv.is_Macro(), rv.tag_str());
         return std::move( rv.as_Macro() );
         }
     TU_ARMA(Hir, mod_ptr) {
         auto rv = rs.find_item_hir(*mod_ptr, item_name, ResolveNamespace::Macro, out_path);
         if( rv.is_None() )
             return ResolveItemRef_Macro::make_None({});
+        ASSERT_BUG(span, rv.is_Macro(), rv.tag_str());
         return std::move( rv.as_Macro() );
         }
     TU_ARMA(ImplicitPrelude, _e)

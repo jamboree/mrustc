@@ -13,8 +13,49 @@
 #include <tagged_union.hpp>
 #include <span.hpp>
 #include "type_ref.hpp"
+#include "generic_ref.hpp"
+#include "expr_ptr.hpp"
+
+struct EncodedLiteral;
 
 namespace HIR {
+
+class EncodedLiteralPtr {
+    EncodedLiteral* p;
+public:
+    ~EncodedLiteralPtr();
+    EncodedLiteralPtr(): p(nullptr) {}
+    EncodedLiteralPtr(EncodedLiteral e);
+
+    EncodedLiteralPtr(EncodedLiteralPtr&& x): p(x.p) { x.p = nullptr; }
+    EncodedLiteralPtr(const EncodedLiteralPtr& x) = delete;
+
+    EncodedLiteralPtr& operator=(EncodedLiteralPtr&& x) { this->~EncodedLiteralPtr(); this->p = x.p; x.p = nullptr; return *this; }
+    EncodedLiteralPtr& operator=(const EncodedLiteralPtr& x) = delete;
+
+    EncodedLiteral& operator*() { assert(p); return *p; }
+    const EncodedLiteral& operator*() const { assert(p); return *p; }
+    EncodedLiteral* operator->() { assert(p); return p; }
+    const EncodedLiteral* operator->() const { assert(p); return p; }
+};
+TAGGED_UNION_EX(ConstGeneric, (), Infer, (
+    (Infer, struct {    // To be inferred
+        unsigned index = ~0u;
+        }),
+    (Unevaluated, std::shared_ptr<HIR::ExprPtr>),    // Unevaluated (or evaluation deferred)
+    (Generic, GenericRef),  // A single generic reference
+    (Evaluated, EncodedLiteralPtr) // A fully known literal
+    ),
+    /*extra_move=*/(),
+    /*extra_assign=*/(),
+    /*extra=*/(
+        ConstGeneric clone() const;
+        bool operator==(const ConstGeneric& x) const;
+        bool operator!=(const ConstGeneric& x) const { return !(*this == x); }
+        Ordering ord(const ConstGeneric& x) const;
+        )
+    );
+::std::ostream& operator<<(::std::ostream& os, const ConstGeneric& x);
 
 class TypeRef;
 class Trait;
@@ -91,7 +132,7 @@ struct PathParams
 {
     //::std::vector<LifetimeRef>  m_lifetimes;
     ::std::vector<TypeRef>  m_types;
-    ::std::vector<HIR::Literal>  m_values;
+    ::std::vector<HIR::ConstGeneric>  m_values;
 
     PathParams();
     PathParams(::HIR::TypeRef );
@@ -107,14 +148,16 @@ struct PathParams
     /// Indicates that params exist (and thus the target requires monomorphisation)
     /// - Ignores lifetime params
     bool has_params() const {
-        return !m_types.empty();
+        return !m_types.empty() || !m_values.empty();
     }
 
     bool operator==(const PathParams& x) const;
     bool operator!=(const PathParams& x) const { return !(*this == x); }
     bool operator<(const PathParams& x) const { return ord(x) == OrdLess; }
     Ordering ord(const PathParams& x) const {
-        return ::ord(m_types, x.m_types);
+        if(auto cmp = ::ord(m_types, x.m_types)) return cmp;
+        if(auto cmp = ::ord(m_values, x.m_values)) return cmp;
+        return OrdEqual;
     }
 
     friend ::std::ostream& operator<<(::std::ostream& os, const PathParams& x);

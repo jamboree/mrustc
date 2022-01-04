@@ -17,17 +17,19 @@
 #include <hir_typeck/static.hpp>
 #include <algorithm>    // std::remove_if
 
-namespace {
+namespace resolve_ufcs {
     class Visitor:
         public ::HIR::Visitor
     {
         const ::HIR::Crate& m_crate;
         bool m_visit_exprs;
+        bool m_run_eat;
 
         typedef ::std::vector< ::std::pair< const ::HIR::SimplePath*, const ::HIR::Trait* > >   t_trait_imports;
         t_trait_imports m_traits;
 
         StaticTraitResolve  m_resolve;
+        bool m_in_trait_def = false;
         const ::HIR::TypeRef* m_current_type = nullptr;
         const ::HIR::Trait* m_current_trait = nullptr;
         const ::HIR::ItemPath* m_current_trait_path = nullptr;
@@ -37,6 +39,7 @@ namespace {
         Visitor(const ::HIR::Crate& crate, bool visit_exprs):
             m_crate(crate),
             m_visit_exprs(visit_exprs),
+            m_run_eat(visit_exprs), // Defaults to running when doing second-pass
             m_resolve(crate)
         {}
 
@@ -44,14 +47,21 @@ namespace {
             Visitor* v;
             t_trait_imports old_imports;
 
+            ModTraitsGuard(Visitor& v, t_trait_imports old_imports): v(&v), old_imports(mv$(old_imports)) {}
+            ModTraitsGuard(ModTraitsGuard&& x): v(x.v), old_imports(mv$(x.old_imports)) { x.v = nullptr; }
+            ModTraitsGuard& operator=(ModTraitsGuard&&) = delete;
             ~ModTraitsGuard() {
-                this->v->m_traits = mv$(this->old_imports);
+                if(v) {
+                    DEBUG("Stack pop: " << this->v->m_traits.size() << " -> " << this->old_imports.size());
+                    this->v->m_traits = mv$(this->old_imports);
+                    v = nullptr;
+                }
             }
         };
         ModTraitsGuard push_mod_traits(const ::HIR::Module& mod) {
             static Span sp;
             DEBUG("");
-            auto rv = ModTraitsGuard {  this, mv$(this->m_traits)  };
+            ModTraitsGuard rv { *this, mv$(this->m_traits)  };
             for( const auto& trait_path : mod.m_traits ) {
                 DEBUG("- " << trait_path);
                 m_traits.push_back( ::std::make_pair( &trait_path, &m_crate.get_trait_by_path(sp, trait_path) ) );
@@ -64,16 +74,32 @@ namespace {
             ::HIR::Visitor::visit_module(p, mod);
         }
 
+        void visit_params(::HIR::GenericParams& params)
+        {
+            TRACE_FUNCTION_F(params.fmt_args() << params.fmt_bounds());
+
+            // Custom visitor to prevent running of EAT on type paramerter defaults
+            auto saved_run_eat = m_run_eat;
+            m_run_eat = false;
+            for(auto& tps : params.m_types) {
+                this->visit_type( tps.m_default );
+            }
+            m_run_eat = saved_run_eat;
+
+            for(auto& bound : params.m_bounds )
+                visit_generic_bound(bound);
+        }
+
         void visit_union(::HIR::ItemPath p, ::HIR::Union& item) override {
-            auto _ = m_resolve.set_item_generics(item.m_params);
+            auto _ = m_resolve.set_impl_generics(item.m_params);
             ::HIR::Visitor::visit_union(p, item);
         }
         void visit_struct(::HIR::ItemPath p, ::HIR::Struct& item) override {
-            auto _ = m_resolve.set_item_generics(item.m_params);
+            auto _ = m_resolve.set_impl_generics(item.m_params);
             ::HIR::Visitor::visit_struct(p, item);
         }
         void visit_enum(::HIR::ItemPath p, ::HIR::Enum& item) override {
-            auto _ = m_resolve.set_item_generics(item.m_params);
+            auto _ = m_resolve.set_impl_generics(item.m_params);
             ::HIR::Visitor::visit_enum(p, item);
         }
         void visit_function(::HIR::ItemPath p, ::HIR::Function& item) override {
@@ -88,12 +114,15 @@ namespace {
 #endif
         }
         void visit_trait(::HIR::ItemPath p, ::HIR::Trait& trait) override {
+            //TRACE_FUNCTION_F("impl" << impl.m_params.fmt_args() << " " << impl.m_type << " (mod=" << impl.m_src_module << ")");
+            m_in_trait_def = true;
             m_current_trait = &trait;
             m_current_trait_path = &p;
             //auto _ = m_resolve.set_cur_trait(p, trait);
             auto _ = m_resolve.set_impl_generics(trait.m_params);
             ::HIR::Visitor::visit_trait(p, trait);
             m_current_trait = nullptr;
+            m_in_trait_def = false;
         }
         void visit_type_impl(::HIR::TypeImpl& impl) override {
             TRACE_FUNCTION_F("impl" << impl.m_params.fmt_args() << " " << impl.m_type << " (mod=" << impl.m_src_module << ")");
@@ -206,7 +235,11 @@ namespace {
                 // Custom to visit the inner expression
                 void visit(::HIR::ExprNode_ArraySized& node) override
                 {
-                    upper_visitor.visit_expr(node.m_size);
+                    auto& as = node.m_size;
+                    if( as.is_Unevaluated() && as.as_Unevaluated().is_Unevaluated() )
+                    {
+                        upper_visitor.visit_expr(*as.as_Unevaluated().as_Unevaluated());
+                    }
                     ::HIR::ExprVisitorDef::visit(node);
                 }
 
@@ -459,8 +492,8 @@ namespace {
                         }
                         return HIR::TypeRef(ty);
                     }
-                    ::HIR::Literal get_value(const Span& sp, const ::HIR::GenericRef& val) const override {
-                        return HIR::Literal(val);
+                    ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& val) const override {
+                        return val;
                     }
                 };
 
@@ -562,6 +595,7 @@ namespace {
         {
             static Span sp;
             auto& e = pd.as_UfcsUnknown();
+            DEBUG("m_traits.size() = " << m_traits.size());
             for( const auto& trait_info : m_traits )
             {
                 const auto& trait = *trait_info.second;
@@ -607,11 +641,13 @@ namespace {
 
             // TODO: If this an associated type, check for default trait params
 
-            if( m_visit_exprs )
+            if( m_run_eat )
             {
                 unsigned counter = 0;
                 while( m_resolve.expand_associated_types_single(sp, ty) )
                 {
+                    //ASSERT_BUG(sp, !visit_ty_with(ty, [&](const HIR::TypeRef& ty)->bool { return TU_TEST1(ty.data(), Generic, .is_placeholder()); }), "Encountered placeholder - " << ty);
+                    visit_ty_with_mut(ty, [&](HIR::TypeRef& ty)->bool { if( TU_TEST1(ty.data(), Generic, .is_placeholder()) ) ty = HIR::TypeRef(); return false; });
                     ASSERT_BUG(sp, counter++ < 20, "Sanity limit exceeded when resolving UFCS in type " << ty);
                     // Invoke a special version of EAT that only processes a single item.
                     // - Keep recursing while this does replacements
@@ -649,7 +685,7 @@ namespace {
                 // If processing a trait, and the type is 'Self', search for the type/method on the trait
                 // - Explicitly encoded because `Self::Type` has a different meaning to `MyType::Type` (the latter will search bounds first)
                 // - NOTE: Could be in an inherent block, where there's no trait
-                if( /*m_current_type &&*/ m_current_trait && e.type == ::HIR::TypeRef("Self", 0xFFFF) )
+                if( /*m_current_type &&*/ m_current_trait && e.type == ::HIR::TypeRef("Self", GENERIC_Self) )
                 {
                     ::HIR::GenericPath  trait_path;
                     if( m_current_trait_path->trait_path() )
@@ -667,7 +703,8 @@ namespace {
                     if( locate_in_trait_and_set(pc, trait_path, *m_current_trait,  p.m_data) ) {
                         assert(!p.m_data.is_UfcsUnknown());
                         // Success!
-                        if( m_in_expr ) {
+                        // - If in an expression (and not in a `trait` provided impl), clear the params
+                        if( m_in_expr && !m_in_trait_def ) {
                             for(auto& t : p.m_data.as_UfcsKnown().trait.m_params.m_types)
                                 t = ::HIR::TypeRef();
                         }
@@ -766,10 +803,7 @@ namespace {
                     return ;
                 }
                 assert(p.m_data.is_UfcsUnknown());
-                DEBUG(e.type);
-                DEBUG(e.type.data().is_Path());
-                DEBUG( static_cast<int>(pc) );
-                DEBUG( (e.type.data().is_Path() && e.type.data().as_Path().binding.is_Enum()) );
+                DEBUG("e.type = " << e.type);
 
                 // If the inner is an enum, look for an enum variant? (check context)
                 if( (pc == HIR::Visitor::PathContext::VALUE /*|| pc == HIR::Visitor::PathContext::PATTERN*/)
@@ -832,8 +866,8 @@ namespace {
                 }
                 }
             TU_ARMA(Range, e) {
-                this->visit_pattern_Value(sp, pat, e.start);
-                this->visit_pattern_Value(sp, pat, e.end);
+                if(e.start) this->visit_pattern_Value(sp, pat, *e.start);
+                if(e.end  ) this->visit_pattern_Value(sp, pat, *e.end);
                 }
             }
         }
@@ -908,6 +942,7 @@ namespace {
         ig.generic.erase(new_end, ig.generic.end());
     }
 
+    // --- Indexing of trait impls ---
     template<typename T>
     void push_index_impl_group_list(::std::vector<const T*>& dst, const ::std::vector<std::unique_ptr<T>>& src)
     {
@@ -934,7 +969,28 @@ namespace {
             push_index_impl_group(dst.m_all_marker_impls[ig.first], ig.second);
         }
     }
+
+    // --- Indexing of inherent methods ---
+    void push_index_inherent_methods_list(::HIR::InherentCache& icache, const HIR::SimplePath& lang_Box, const ::std::vector<std::unique_ptr< HIR::TypeImpl >>& src)
+    {
+        Span    sp;
+        for(const auto& ti : src)
+        {
+            const auto& impl = *ti;
+            DEBUG("impl" << impl.m_params.fmt_args() << " " << impl.m_type);
+            icache.insert_all(sp, impl, lang_Box);
+        }
+    }
+    void push_index_inherent_methods(::HIR::InherentCache& icache, const HIR::SimplePath& lang_Box, const ::HIR::Crate& src)
+    {
+        for(const auto& e : src.m_type_impls.named) {
+            push_index_inherent_methods_list(icache, lang_Box, e.second);
+        }
+        push_index_inherent_methods_list(icache, lang_Box, src.m_type_impls.non_named);
+        push_index_inherent_methods_list(icache, lang_Box, src.m_type_impls.generic  );
+    }
 }   // namespace ""
+using namespace resolve_ufcs;
 
 void ConvertHIR_ResolveUFCS_Outer(::HIR::Crate& crate)
 {
@@ -972,5 +1028,13 @@ void ConvertHIR_ResolveUFCS_SortImpls(::HIR::Crate& crate)
     push_index_impls(crate, crate);
     for(const auto& ec : crate.m_ext_crates) {
         push_index_impls(crate, *ec.second.m_data);
+    }
+
+    {
+        const auto& lang_Box = crate.get_lang_item_path_opt("owned_box");
+        push_index_inherent_methods(crate.m_inherent_method_cache, lang_Box, crate);
+        for(const auto& ec : crate.m_ext_crates) {
+            push_index_inherent_methods(crate.m_inherent_method_cache, lang_Box, *ec.second.m_data);
+        }
     }
 }

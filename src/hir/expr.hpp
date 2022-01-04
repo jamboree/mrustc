@@ -13,6 +13,7 @@
 #include <span.hpp>
 #include <hir/visitor.hpp>
 #include <hir_typeck/common.hpp>
+#include "asm.hpp"
 
 namespace HIR {
 
@@ -110,6 +111,39 @@ struct ExprNode_Asm:
         m_inputs( mv$(inputs) ),
         m_clobbers( mv$(clobbers) ),
         m_flags( mv$(flags) )
+    {
+    }
+
+    NODE_METHODS();
+};
+struct ExprNode_Asm2:
+    public ExprNode
+{
+    TAGGED_UNION(Param, Const,
+        (Const, HIR::ExprNodeP),
+        (Sym, HIR::Path),
+        (RegSingle, struct {
+            AsmCommon::Direction    dir;
+            AsmCommon::RegisterSpec spec;
+            HIR::ExprNodeP  val;
+            }),
+        (Reg, struct {
+            AsmCommon::Direction    dir;
+            AsmCommon::RegisterSpec spec;
+            HIR::ExprNodeP  val_in;
+            HIR::ExprNodeP  val_out;
+            })
+        );
+
+    AsmCommon::Options  m_options;
+    std::vector<AsmCommon::Line>   m_lines;
+    std::vector<Param>  m_params;
+
+    ExprNode_Asm2(Span sp, AsmCommon::Options options, std::vector<AsmCommon::Line> lines, std::vector<Param> params)
+        : ExprNode(mv$(sp))
+        , m_options(options)
+        , m_lines( move(lines) )
+        , m_params( move(params) )
     {
     }
 
@@ -367,6 +401,20 @@ struct ExprNode_Borrow:
     ::HIR::ExprNodeP    m_value;
 
     ExprNode_Borrow(Span sp, ::HIR::BorrowType bt, ::HIR::ExprNodeP value):
+        ExprNode( mv$(sp) ),
+        m_type(bt),
+        m_value( mv$(value) )
+    {}
+
+    NODE_METHODS();
+};
+struct ExprNode_RawBorrow:
+    public ExprNode
+{
+    ::HIR::BorrowType   m_type;
+    ::HIR::ExprNodeP    m_value;
+
+    ExprNode_RawBorrow(Span sp, ::HIR::BorrowType bt, ::HIR::ExprNodeP value):
         ExprNode( mv$(sp) ),
         m_type(bt),
         m_value( mv$(value) )
@@ -739,14 +787,12 @@ struct ExprNode_ArraySized:
     public ExprNode
 {
     ::HIR::ExprNodeP    m_val;
-    ::HIR::ExprPtr  m_size;
-    size_t  m_size_val;
+    ::HIR::ArraySize    m_size;
 
     ExprNode_ArraySized(Span sp, ::HIR::ExprNodeP val, ::HIR::ExprPtr size):
         ExprNode(mv$(sp)),
         m_val( mv$(val) ),
-        m_size( mv$(size) ),
-        m_size_val( ~0u )
+        m_size( HIR::ConstGeneric(std::make_shared<HIR::ExprPtr>(mv$(size))) )
     {}
 
     NODE_METHODS();
@@ -769,7 +815,13 @@ struct ExprNode_Closure:
         Mut,
         Once,
     } m_class = Class::Unknown;
-    bool m_is_copy = false;
+    bool m_is_copy = true;  // Assume that closures are Copy/Clone (for the purposes of typecheck) until AVU is run
+
+    // - Cache between the AVU and ExpandClosures passes
+    struct {
+        ::std::vector<unsigned int> local_vars;
+        ::std::vector< ::std::pair<unsigned int, ::HIR::ValueUsage> > captured_vars;
+    } m_avu_cache;
 
     // - Path to the generated closure type
     const ::HIR::Struct*    m_obj_ptr = nullptr;
@@ -797,6 +849,11 @@ struct ExprNode_Generator:
     ::HIR::ExprNodeP    m_code;
     bool    m_is_move;
     bool    m_is_pinned;
+
+    struct {
+        ::std::vector<unsigned int> local_vars;
+        ::std::vector< ::std::pair<unsigned int, ::HIR::ValueUsage> > captured_vars;
+    } m_avu_cache;
 
     // Generated type information
     const ::HIR::Struct*    m_obj_ptr = nullptr;
@@ -862,6 +919,7 @@ public:
 
     NV(ExprNode_Block)
     NV(ExprNode_Asm)
+    NV(ExprNode_Asm2)
     NV(ExprNode_Return)
     NV(ExprNode_Yield)
     NV(ExprNode_Let)
@@ -874,6 +932,7 @@ public:
     NV(ExprNode_BinOp)
     NV(ExprNode_UniOp)
     NV(ExprNode_Borrow)
+    NV(ExprNode_RawBorrow)
     NV(ExprNode_Cast)   // Conversion
     NV(ExprNode_Unsize) // Coercion
     NV(ExprNode_Index)
@@ -913,6 +972,7 @@ public:
 
     NV(ExprNode_Block)
     NV(ExprNode_Asm)
+    NV(ExprNode_Asm2)
     NV(ExprNode_Return)
     NV(ExprNode_Yield)
     NV(ExprNode_Let)
@@ -925,6 +985,7 @@ public:
     NV(ExprNode_BinOp)
     NV(ExprNode_UniOp)
     NV(ExprNode_Borrow)
+    NV(ExprNode_RawBorrow)
     NV(ExprNode_Cast)
     NV(ExprNode_Unsize)
     NV(ExprNode_Index)

@@ -179,18 +179,12 @@ void Trans_AutoImpl_Clone(State& state, ::HIR::TypeRef ty)
 
     // Function
     ::HIR::Function fcn {
-        /*m_save_code=*/false,
-        ::HIR::Linkage {},
         ::HIR::Function::Receiver::BorrowShared,
-        /*m_abi=*/ABI_RUST,
-        /*m_unsafe =*/false,
-        /*m_const=*/false,
         ::HIR::GenericParams {},
         /*m_args=*/::make_vec1(::std::make_pair(
             ::HIR::Pattern( ::HIR::PatternBinding(false, ::HIR::PatternBinding::Type::Move, "self", 0), ::HIR::Pattern::Data::make_Any({}) ),
             ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ty.clone())
             )),
-        /*m_variadic=*/false,
         /*m_return=*/ty.clone(),
         ::HIR::ExprPtr {}
         };
@@ -437,10 +431,11 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
                 else if( TARGETVER_LEAST_1_39 && trait_path.m_path == state.resolve.m_lang_FnOnce )
                     offset = 2;
                 else
-                    offset = 3;
+                    offset = 3; // Wait, is this reachable?
 
                 for(; offset < sizeof(entries)/sizeof(entries[0]); offset ++)
                 {
+                    bool is_by_value = (offset == 2);
                     const auto& ent = entries[offset];
 
                     auto fcn_p = path.clone();
@@ -455,7 +450,7 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
 
                     HIR::Function   fcn;
                     fcn.m_return = te->m_rettype.clone();
-                    fcn.m_args.push_back(std::make_pair( HIR::Pattern(), HIR::TypeRef::new_borrow(ent.bt, type.clone()) ));
+                    fcn.m_args.push_back(std::make_pair( HIR::Pattern(), !is_by_value ? HIR::TypeRef::new_borrow(ent.bt, type.clone()) : type.clone() ));
                     fcn.m_args.push_back(std::make_pair( HIR::Pattern(), mv$(arg_ty) ));
 
                     fcn.m_code.m_mir = MIR::FunctionPointer(new MIR::Function());
@@ -467,7 +462,8 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
                         arg_params.push_back(MIR::LValue::new_Field(MIR::LValue::new_Argument(1), i));
                     }
                     builder.terminate_Call(MIR::LValue::new_Return(),
-                        MIR::LValue::new_Deref(MIR::LValue::new_Argument(0)), mv$(arg_params),
+                        !is_by_value ? MIR::LValue::new_Deref(MIR::LValue::new_Argument(0)) : MIR::LValue::new_Argument(0),
+                        mv$(arg_params),
                         1, 2
                         );
                     // BB1: Return
@@ -508,21 +504,36 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
             // Create vtable contents
             auto monomorph_cb_trait = MonomorphStatePtr(&type, &trait_path.m_params, nullptr);
 
-            ::std::vector<HIR::Literal> vtable_contents;
-            vtable_contents.reserve( 3 + trait.m_value_indexes.size() );
+
+            HIR::Linkage linkage;
+            linkage.type = HIR::Linkage::Type::Weak;
+            HIR::Static vtable_static( ::std::move(linkage), /*is_mut*/false, mv$(vtable_ty), {} );
+            auto& vtable_data = vtable_static.m_value_res;
+            const auto ptr_bytes = Target_GetPointerBits()/8;
+            vtable_data.bytes.resize( (3+trait.m_value_indexes.size()) * ptr_bytes );
+            size_t ofs = 0;
+            auto push_ptr = [&vtable_data,&ofs,ptr_bytes](HIR::Path p) {
+                assert(ofs + ptr_bytes <= vtable_data.bytes.size());
+                vtable_data.relocations.push_back(Reloc::new_named( ofs, ptr_bytes, mv$(p) ));
+                vtable_data.write_uint(ofs, ptr_bytes, EncodedLiteral::PTR_BASE);
+                ofs += ptr_bytes;
+                assert(ofs <= vtable_data.bytes.size());
+            };
             // Drop glue
             trans_list.m_drop_glue.insert( type.clone() );
-            vtable_contents.push_back( HIR::Literal::make_BorrowPath(::HIR::Path(type.clone(), "#drop_glue")) );
+            push_ptr(::HIR::Path(type.clone(), "#drop_glue"));
             // Size & align
             {
                 size_t  size, align;
                 // NOTE: Uses the Size+Align version because that doesn't panic on unsized
                 ASSERT_BUG(sp, Target_GetSizeAndAlignOf(sp, state.resolve, type, size, align), "Unexpected generic? " << type);
-                vtable_contents.push_back( HIR::Literal::make_Integer(size) );
-                vtable_contents.push_back( HIR::Literal::make_Integer(align) );
+                vtable_data.write_uint(ofs, ptr_bytes, size ); ofs += ptr_bytes;
+                vtable_data.write_uint(ofs, ptr_bytes, align); ofs += ptr_bytes;
             }
+
             // Methods
             // - The `m_value_indexes` list isn't sorted (well, it's sorted differently) so we need an `O(n^2)` search
+
             for(unsigned int i = 0; i < trait.m_value_indexes.size(); i ++ )
             {
                 // Find the corresponding vtable entry
@@ -593,30 +604,10 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
                         }
                     }
                     //MIR_ASSERT(*m_mir_res, tr.m_values.at(m.first).is_Function(), "TODO: Handle generating vtables with non-function items");
-
-                    vtable_contents.push_back( HIR::Literal::make_BorrowPath(mv$(item_path)) );
+                    push_ptr(mv$(item_path));
                 }
-                assert(vtable_contents.size() == 3+i+1);
             }
-
-            HIR::Linkage linkage;
-            linkage.type = HIR::Linkage::Type::Weak;
-            HIR::Static vtable_static( ::std::move(linkage), /*is_mut*/false, mv$(vtable_ty), {} );
-            auto& vtable_data = vtable_static.m_value_res;
-            vtable_data.bytes.resize( vtable_contents.size() * Target_GetPointerBits() / 8 );
-            for(auto& e : vtable_contents)
-            {
-                auto ofs = Target_GetPointerBits()/8 * (&e - &vtable_contents.front());
-                uint64_t v;
-                if( e.is_BorrowPath() ) {
-                    vtable_data.relocations.push_back(Reloc::new_named( ofs, Target_GetPointerBits()/8, mv$(e.as_BorrowPath()) ));
-                    v = EncodedLiteral::PTR_BASE;
-                }
-                else {
-                    v = e.as_Integer();
-                }
-                vtable_data.write_uint(ofs, Target_GetPointerBits()/8, v);
-            }
+            assert(ofs == vtable_data.bytes.size());
             vtable_static.m_value_generated = true;
 
             // Add to list

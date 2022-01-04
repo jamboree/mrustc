@@ -26,6 +26,7 @@ struct PackageVersion
     unsigned major;
     unsigned minor;
     unsigned patch;
+    bool patch_set;
 
     static PackageVersion from_string(const ::std::string& s);
 
@@ -56,39 +57,40 @@ struct PackageVersion
         }
     }
 
+    int cmp(const PackageVersion& x) const {
+        if( major != x.major )  return (major < x.major) ? -1 : 1;
+        if( minor != x.minor )  return (minor < x.minor) ? -1 : 1;
+        if( x.patch_set == patch_set ) {
+            return (patch < x.patch) ? -1 : 1;
+        }
+        else {
+            return 0;
+        }
+    }
+
     bool operator==(const PackageVersion& x) const {
-        if( major != x.major )  return false;
-        if( minor != x.minor )  return false;
-        return patch == x.patch;
+        return cmp(x) == 0;
     }
     bool operator!=(const PackageVersion& x) const {
-        if( major != x.major )  return true;
-        if( minor != x.minor )  return true;
-        return patch != x.patch;
+        return cmp(x) != 0;
     }
     bool operator<(const PackageVersion& x) const {
-        if( major != x.major )  return major < x.major;
-        if( minor != x.minor )  return minor < x.minor;
-        return patch < x.patch;
+        return cmp(x) < 0;
     }
     bool operator<=(const PackageVersion& x) const {
-        if( major != x.major )  return major < x.major;
-        if( minor != x.minor )  return minor < x.minor;
-        return patch <= x.patch;
+        return cmp(x) <= 0;
     }
     bool operator>(const PackageVersion& x) const {
-        if( major != x.major )  return major > x.major;
-        if( minor != x.minor )  return minor > x.minor;
-        return patch > x.patch;
+        return cmp(x) > 0;
     }
     bool operator>=(const PackageVersion& x) const {
-        if( major != x.major )  return major > x.major;
-        if( minor != x.minor )  return minor > x.minor;
-        return patch >= x.patch;
+        return cmp(x) >= 0;
     }
 
     friend ::std::ostream& operator<<(::std::ostream& os, const PackageVersion& v) {
-        os << v.major << "." << v.minor << "." << v.patch;
+        os << v.major << "." << v.minor;
+        if(v.patch_set)
+            os << "." << v.patch;
         return os;
     }
 };
@@ -261,7 +263,7 @@ public:
     // cargo:rustc-flags=-l foo
     ::std::vector<::std::string>    rustc_flags;
     // cargo:rustc-env=FOO=BAR
-    ::std::vector<::std::string>    rustc_env;
+    ::std::vector<::std::pair<::std::string, ::std::string>>    rustc_env;
 
     // cargo:foo=bar when [package]links=baz
     ::std::vector<::std::pair<::std::string, ::std::string>>    downstream_env;
@@ -280,9 +282,13 @@ class PackageManifest
 
     ::std::string   m_build_script;
 
-    ::std::vector<PackageRef>   m_dependencies;
-    ::std::vector<PackageRef>   m_build_dependencies;
-    ::std::vector<PackageRef>   m_dev_dependencies;
+    struct Dependencies {
+        ::std::vector<PackageRef>   main;
+        ::std::vector<PackageRef>   build;
+        ::std::vector<PackageRef>   dev;
+    };
+    Dependencies    m_dependencies;
+    std::map<std::string,Dependencies>  m_target_dependencies;
 
     ::std::vector<PackageTarget>    m_targets;
 
@@ -340,14 +346,24 @@ public:
     const BuildScriptOutput& build_script_output() const {
         return m_build_script_output;
     }
-    const ::std::vector<PackageRef>& dependencies() const {
-        return m_dependencies;
+    void iter_dep_groups(std::function<void(const Dependencies&)> cb) const;
+    void iter_main_dependencies(std::function<void(const PackageRef&)> cb) const {
+        iter_dep_groups([=](const Dependencies& deps) {
+            for(const auto& d : deps.main)
+                cb(d);
+            });
     }
-    const ::std::vector<PackageRef>& build_dependencies() const {
-        return m_build_dependencies;
+    void iter_build_dependencies(std::function<void(const PackageRef&)> cb) const {
+        iter_dep_groups([=](const Dependencies& deps) {
+            for(const auto& d : deps.build)
+                cb(d);
+            });
     }
-    const ::std::vector<PackageRef>& dev_dependencies() const {
-        return m_dev_dependencies;
+    void iter_dev_dependencies(std::function<void(const PackageRef&)> cb) const {
+        iter_dep_groups([=](const Dependencies& deps) {
+            for(const auto& d : deps.dev)
+                cb(d);
+            });
     }
     const ::std::vector<::std::string>& active_features() const {
         return m_active_features;

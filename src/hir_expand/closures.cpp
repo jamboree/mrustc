@@ -143,14 +143,15 @@ namespace {
         }
 
         void visit_pattern(const Span& sp, ::HIR::Pattern& pat) override {
-            if( pat.m_binding.is_valid() ) {
-                auto binding_it = ::std::find(m_local_vars.begin(), m_local_vars.end(), pat.m_binding.m_slot);
+            for(auto& pb : pat.m_bindings)
+            {
+                auto binding_it = ::std::find(m_local_vars.begin(), m_local_vars.end(), pb.m_slot);
                 if( binding_it != m_local_vars.end() ) {
                     // NOTE: Offset of 1 is for `self` (`args` is destructured)
-                    pat.m_binding.m_slot = 1 + binding_it - m_local_vars.begin();
+                    pb.m_slot = 1 + binding_it - m_local_vars.begin();
                 }
                 else {
-                    BUG(sp, "Pattern binds to non-local - " << pat.m_binding);
+                    BUG(sp, "Pattern binds to non-local - " << pb);
                 }
             }
 
@@ -280,6 +281,7 @@ namespace {
     class ExprVisitor_Fixup:
         public ::HIR::ExprVisitorDef
     {
+    public:
         const ::HIR::Crate& m_crate;
         StaticTraitResolve  m_resolve;
         const Monomorphiser&    m_monomorphiser;
@@ -351,6 +353,8 @@ namespace {
             // Handle casts from closures to function pointers
             if( node.m_value->m_res_type.data().is_Closure() )
             {
+                TRACE_FUNCTION_FR("_Cast: " << &node << " " << node.m_value->m_res_type, node.m_value->m_res_type);
+
                 const auto& src_te = node.m_value->m_res_type.data().as_Closure();
                 ASSERT_BUG(sp, node.m_res_type.data().is_Function(), "Cannot convert closure to non-fn type");
                 //const auto& dte = node.m_res_type.m_data.as_Function();
@@ -359,16 +363,18 @@ namespace {
                     ERROR(sp, E0000, "Cannot cast a closure with captures to a fn() type");
                 }
 
-                ::HIR::FunctionType    fcn_ty_inner { /*is_unsafe=*/false, ABI_RUST, src_te.node->m_return.clone(), {} };
-                ::std::vector<::HIR::TypeRef>   arg_types;
-                fcn_ty_inner.m_arg_types.reserve(src_te.node->m_args.size());
-                arg_types.reserve(src_te.node->m_args.size());
-                for(const auto& arg : src_te.node->m_args)
-                {
-                    fcn_ty_inner.m_arg_types.push_back( arg.second.clone() );
-                    arg_types.push_back(arg.second.clone());
+                //auto ms = MonomorphStatePtr(nullptr, &src_te.node->m_obj_path.m_params, nullptr);
+                //auto monomorph = [&](const HIR::TypeRef& ty)->HIR::TypeRef { return src_te.node->m_obj_ptr ? ms.monomorph_type(sp, ty) : ty.clone_shallow(); };
+                //::HIR::FunctionType    fcn_ty_inner { /*is_unsafe=*/false, ABI_RUST, monomorph(src_te.node->m_return), {} };
+                //fcn_ty_inner.m_arg_types.reserve(src_te.node->m_args.size());
+                //for(const auto& arg : src_te.node->m_args) {
+                //    fcn_ty_inner.m_arg_types.push_back( monomorph(arg.second) );
+                //}
+                ::HIR::FunctionType    fcn_ty_inner { /*is_unsafe=*/false, ABI_RUST, src_te.m_rettype.clone_shallow(), {} };
+                fcn_ty_inner.m_arg_types.reserve(src_te.m_arg_types.size());
+                for(const auto& arg : src_te.m_arg_types) {
+                    fcn_ty_inner.m_arg_types.push_back( arg.clone_shallow() );
                 }
-                auto trait_params = ::HIR::PathParams( ::HIR::TypeRef(mv$(arg_types)) );
                 auto res_ty = ::HIR::TypeRef(mv$(fcn_ty_inner));
 
                 const auto& str = *src_te.node->m_obj_ptr;
@@ -451,15 +457,9 @@ namespace {
             return ::HIR::TraitImpl {
                 mv$(params), {}, mv$(closure_type),
                 make_map1(
-                    RcString::new_interned("call_free"), ::HIR::TraitImpl::ImplEnt< ::HIR::Function> { false, ::HIR::Function {
-                        false, ::HIR::Linkage {},
-                        ::HIR::Function::Receiver::Free,
-                        ABI_RUST, false, false,
-                        {},
-                        mv$(args), false,
-                        ret_ty.clone(),
-                        mv$(code)
-                        } }
+                    RcString::new_interned("call_free"), ::HIR::TraitImpl::ImplEnt< ::HIR::Function> { false,
+                        ::HIR::Function( ::HIR::Function::Receiver::Free, ::HIR::GenericParams {}, mv$(args), ret_ty.clone(), mv$(code))
+                        }
                     ),
                 {},
                 {},
@@ -482,17 +482,15 @@ namespace {
                 mv$(params), mv$(trait_params), mv$(closure_type),
                 make_map1(
                     RcString::new_interned("call_once"), ::HIR::TraitImpl::ImplEnt< ::HIR::Function> { false, ::HIR::Function {
-                        false, ::HIR::Linkage {},
                         ::HIR::Function::Receiver::Value,
-                        ABI_RUST, false, false,
-                        {},
+                        ::HIR::GenericParams {},
                         make_vec2(
                             ::std::make_pair(
-                                ::HIR::Pattern { {false, ::HIR::PatternBinding::Type::Move, "self", 0}, {} },
+                                ::HIR::Pattern { HIR::PatternBinding {false, ::HIR::PatternBinding::Type::Move, "self", 0}, {} },
                                 mv$(ty_of_self)
                                 ),
                             mv$( args_argent )
-                            ), false,
+                            ),
                         ret_ty.clone(),
                         mv$(code)
                         } }
@@ -520,17 +518,15 @@ namespace {
                 mv$(params), mv$(trait_params), mv$(closure_type),
                 make_map1(
                     RcString::new_interned("call_mut"), ::HIR::TraitImpl::ImplEnt< ::HIR::Function> { false, ::HIR::Function {
-                        false, ::HIR::Linkage {},
                         ::HIR::Function::Receiver::BorrowUnique,
-                        ABI_RUST, false, false,
-                        {},
+                        ::HIR::GenericParams {},
                         make_vec2(
                             ::std::make_pair(
                                 ::HIR::Pattern { {false, ::HIR::PatternBinding::Type::Move, "self", 0}, {} },
                                 mv$(ty_of_self)
                                 ),
                             mv$( args_argent )
-                            ), false,
+                            ),
                         ret_ty.clone(),
                         mv$(code)
                         } }
@@ -556,17 +552,15 @@ namespace {
                 mv$(params), mv$(trait_params), mv$(closure_type),
                 make_map1(
                     RcString::new_interned("call"), ::HIR::TraitImpl::ImplEnt< ::HIR::Function> { false, ::HIR::Function {
-                        false, ::HIR::Linkage {},
                         ::HIR::Function::Receiver::BorrowShared,
-                        ABI_RUST, false, false,
-                        {},
+                        ::HIR::GenericParams {},
                         make_vec2(
                             ::std::make_pair(
                                 ::HIR::Pattern { {false, ::HIR::PatternBinding::Type::Move, "self", 0}, {} },
                                 mv$(ty_of_self)
                                 ),
                             mv$(args_argent)
-                            ), false,
+                            ),
                         ret_ty.clone(),
                         mv$(code)
                         } }
@@ -583,95 +577,16 @@ namespace {
     class ExprVisitor_Extract:
         public ::HIR::ExprVisitorDef
     {
-
-        struct ClosureScope
-        {
-            ::HIR::ExprNode_Closure&    node;
-            ::std::vector<unsigned int> local_vars;
-            // - Lists captured variables to be stored in autogenerated struct (and how they're used, influencing the borrow type)
-            ::std::vector< ::std::pair<unsigned int, ::HIR::ValueUsage> > captured_vars;
-
-            ClosureScope(::HIR::ExprNode_Closure& node):
-                node(node)
-            {
-            }
-        };
-
-        /// Scope state for generators
-        /// 
-        /// Collates variable usage (for capture usage) and which variables need to be saved across yield
-        struct GeneratorScope
-        {
-            static const unsigned STACK_MARKER_LOOP;
-
-            ::HIR::ExprNode_Generator&  node;
-
-            // Note: Counts the total number of `yield`s encountered
-            // - Loops are pre-counted to either be `-2` (no inner yields) or `-1` (has an inner yield)
-            std::vector<unsigned>    yield_stack;
-            struct Var {
-                // If
-                // > `defined_stack` is empty
-                // > OR `defined_stack` isn't a prefix of `last_used_stack`
-                // > OR `last_used_stack`'s tail contains a yielding loop
-                // - Then the variable needs to be saved
-                std::vector<unsigned>   defined_stack;
-                std::vector<unsigned>   last_used_stack;
-
-                ::HIR::ValueUsage   usage;
-
-                bool is_saved() const
-                {
-                    assert(defined_stack.size() <= last_used_stack.size());
-                    // If `defined_stack` isn't a prefix of `last_used_stack`: The variable needs to be saved
-                    for(size_t i = 0; i < defined_stack.size(); i ++)
-                    {
-                        if(defined_stack[i] != last_used_stack[i]) {
-                            return true;
-                        }
-                    }
-                    // If there was a loop present during use: also saved
-                    for(size_t i = defined_stack.size(); i < last_used_stack.size(); i ++)
-                    {
-                        if(last_used_stack[i] == STACK_MARKER_LOOP) {
-                            return true;
-                        }
-                    }
-
-                    return false;
-                }
-            };
-            std::map<unsigned, Var> used_variables;
-
-            GeneratorScope(::HIR::ExprNode_Generator& node):
-                node(node)
-            {
-                // This should always be non-empty
-                yield_stack.push_back(0);
-            }
-        };
-        TAGGED_UNION(Scope, None,
-            (None, struct{}),
-            (Closure, ClosureScope),
-            (Generator, GeneratorScope)
-            );
-
         const StaticTraitResolve& m_resolve;
         const ::HIR::TypeRef*   m_self_type;
-        ::std::vector< ::HIR::TypeRef>& m_variable_types;
+        const ::std::vector< ::HIR::TypeRef>& m_variable_types;
 
         // Outputs
         OutState&   m_out;
         const char* m_new_type_suffix;
 
-        /// Stack of active closures
-        ::std::vector<Scope> m_closure_stack;
-
-        // TODO: Information for generators too
-        // - Doing both in one go is simpler
-
     public:
-        ExprVisitor_Extract(const StaticTraitResolve& resolve, const ::HIR::TypeRef* self_type, ::std::vector< ::HIR::TypeRef>& var_types, OutState& out, const char* new_type_suffix):
+        ExprVisitor_Extract(const StaticTraitResolve& resolve, const ::HIR::TypeRef* self_type, const ::std::vector< ::HIR::TypeRef>& var_types, OutState& out, const char* new_type_suffix):
             m_resolve(resolve),
             m_self_type(self_type),
             m_variable_types(var_types),
@@ -722,7 +637,7 @@ namespace {
                 ASSERT_BUG(sp, i < params.m_types.size(), "Item generic binding OOR - " << ge << " (" << i << " !< " << params.m_types.size() << ")");
                 return ::HIR::TypeRef(params.m_types[i].m_name, i);
             }
-            ::HIR::Literal get_value(const Span& sp, const ::HIR::GenericRef& ge) const {
+            ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& ge) const {
                 unsigned i;
                 if( ge.binding == 0xFFFF ) {
                     BUG(sp, "Binding 0xFFFF isn't valid for values");
@@ -817,44 +732,19 @@ namespace {
         /// </summary>
         void visit(::HIR::ExprNode_Closure& node) override
         {
+            if(!node.m_code)
+            {
+                DEBUG("Already expanded (via consteval?)");
+                return ;
+            }
+
             const auto& sp = node.span();
 
             TRACE_FUNCTION_F("Extract closure - " << node.m_res_type);
 
             ASSERT_BUG(sp, node.m_obj_path == ::HIR::GenericPath(), "Closure path already set? " << node.m_obj_path);
 
-            // --- Determine borrow set ---
-            m_closure_stack.push_back( ClosureScope(node) );
-
-            for(const auto& arg : node.m_args) {
-                add_closure_def_from_pattern(node.span(), arg.first);
-            }
-
             ::HIR::ExprVisitorDef::visit(node);
-
-            auto ent = mv$( m_closure_stack.back().as_Closure() );
-            m_closure_stack.pop_back();
-            DEBUG("Captures: " << ent.captured_vars);
-            DEBUG("Locals: " << ent.local_vars);
-
-            // - If this closure is a move closure, mutate `captured_vars` such that all captures are tagged with ValueUsage::Move
-            if( node.m_is_move )
-            {
-                for(auto& cap : ent.captured_vars)
-                {
-                    cap.second = ::HIR::ValueUsage::Move;
-                }
-            }
-            // --- Apply the capture set for this closure to the parent ---
-            if( m_closure_stack.size() > 0 )
-            {
-                DEBUG("> Apply to parent");
-                for(const auto& cap : ent.captured_vars)
-                {
-                    mark_used_variable(node.span(), cap.first, cap.second);
-                }
-            }
-
 
             // --- Extract and mutate code into a trait impl on the closure type ---
 
@@ -867,7 +757,7 @@ namespace {
 
             DEBUG("--- Mutate inner code");
             // 2. Iterate over the nodes and rewrite variable accesses to either renumbered locals, or field accesses
-            ExprVisitor_Mutate    ev { node.m_res_type, ent.local_vars, ent.captured_vars, monomorph_cb };
+            ExprVisitor_Mutate    ev { node.m_res_type, node.m_avu_cache.local_vars, node.m_avu_cache.captured_vars, monomorph_cb };
             ev.visit_node_ptr( node.m_code );
             // NOTE: `ev` is used down in `Args` to convert the argument destructuring pattern
 
@@ -875,7 +765,7 @@ namespace {
             DEBUG("--- Build locals and captures");
             ::std::vector< ::HIR::TypeRef>  local_types;
             local_types.push_back( ::HIR::TypeRef() );  // self - filled by make_fn*
-            for(const auto binding_idx : ent.local_vars) {
+            for(const auto binding_idx : node.m_avu_cache.local_vars) {
                 local_types.push_back( monomorph( m_variable_types.at(binding_idx).clone() ) );
             }
             // - Generate types of captures, and construct the actual capture values
@@ -883,10 +773,10 @@ namespace {
             ::std::vector< ::HIR::VisEnt< ::HIR::TypeRef> > capture_types;
             //  > Capture value nodes
             ::std::vector< ::HIR::ExprNodeP>    capture_nodes;
-            capture_types.reserve( ent.captured_vars.size() );
-            capture_nodes.reserve( ent.captured_vars.size() );
+            capture_types.reserve( node.m_avu_cache.captured_vars.size() );
+            capture_nodes.reserve( node.m_avu_cache.captured_vars.size() );
             node.m_is_copy = true;
-            for(const auto binding : ent.captured_vars)
+            for(const auto binding : node.m_avu_cache.captured_vars)
             {
                 const auto binding_idx = binding.first;
                 auto binding_type = binding.second;
@@ -922,7 +812,7 @@ namespace {
                 // - Fix type to replace closure types with known paths
                 ExprVisitor_Fixup   fixup { m_resolve.m_crate, &params, monomorph_cb };
                 fixup.visit_type(ty_mono);
-                if( !m_resolve.type_is_copy(sp, ty_mono) )
+                if( !fixup.m_resolve.type_is_copy(sp, ty_mono) )
                 {
                     node.m_is_copy = false;
                 }
@@ -968,7 +858,7 @@ namespace {
                 args_ty_inner.push_back( monomorph_cb.monomorph_type(sp, arg.second) );
             }
             ::HIR::TypeRef  args_ty { mv$(args_ty_inner) };
-            ::HIR::Pattern  args_pat { {}, ::HIR::Pattern::Data::make_Tuple({ mv$(args_pat_inner) }) };
+            ::HIR::Pattern  args_pat { HIR::PatternBinding(), ::HIR::Pattern::Data::make_Tuple({ mv$(args_pat_inner) }) };
             ::HIR::TypeRef  ret_type = monomorph_cb.monomorph_type(sp, node.m_return);
 
             DEBUG("args_ty = " << args_ty << ", ret_type = " << ret_type);
@@ -1189,36 +1079,7 @@ namespace {
             TRACE_FUNCTION_F("Extract generator - " << node.m_res_type);
 
             // 1. Recurse to obtain useful metadata
-            m_closure_stack.push_back(GeneratorScope(node));
             ::HIR::ExprVisitorDef::visit(node);
-            auto ent = std::move(m_closure_stack.back().as_Generator());
-            m_closure_stack.pop_back();
-
-            // - If this closure is a move closure, mutate `captured_vars` such that all captures are tagged with ValueUsage::Move
-            if( node.m_is_move )
-            {
-                for(auto& cap : ent.used_variables)
-                {
-                    if(cap.second.defined_stack.empty())
-                    {
-                        cap.second.usage = ::HIR::ValueUsage::Move;
-                    }
-                }
-            }
-
-            // - Apply into the parent stack
-            if( m_closure_stack.size() > 0 )
-            {
-                DEBUG("> Apply to parent");
-                for(const auto& cap : ent.used_variables)
-                {
-                    // Only apply already-defined variables (ones without a set `defined_stack`)
-                    if(cap.second.defined_stack.empty())
-                    {
-                        mark_used_variable(node.span(), cap.first, cap.second.usage);
-                    }
-                }
-            }
 
             // -- Prepare type params for rewriting the expression tree
             ::HIR::GenericParams params;
@@ -1253,26 +1114,8 @@ namespace {
             // - Captures: defined outside and need to be captured using closure capture rules (`defined_stack.empty()`)
             // - Saved: defined inside but used across a yield boundary (see GeneratorState)
             // - Local: defined and used between two yields
-            size_t n_caps = 0;
-            size_t n_locals = 0;
-            for(const auto& cap : ent.used_variables)
-            {
-                if( cap.second.defined_stack.empty() )
-                {
-                    n_caps += 1;
-                }
-                else
-                {
-                    n_locals += 1;
-                }
-            }
-            TAGGED_UNION(VarUsage, Capture,
-                (Capture, struct {
-                    unsigned field_index;
-                    bool needs_deref;
-                    }),
-                (Local, struct { unsigned new_slot; })
-                );
+            size_t n_caps = node.m_avu_cache.captured_vars.size();
+            size_t n_locals = node.m_avu_cache.local_vars.size();
             ::std::map<unsigned, unsigned> variable_rewrites;
             ::std::vector<HIR::ValueUsage> capture_usages; capture_usages.reserve(n_caps);
             ::std::vector<HIR::TypeRef>   new_locals; new_locals.reserve(1 + n_caps + n_locals);
@@ -1288,52 +1131,43 @@ namespace {
             struct_ents.push_back(HIR::VisEnt<HIR::TypeRef> { HIR::Publicity::new_none(), ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_MaybeUninit, ::HIR::PathParams(state_type.clone())), &unm_MaybeUninit ) });
 
             // Add captures to the locals list first
-            for(const auto& cap : ent.used_variables)
+            for(const auto& cap : node.m_avu_cache.captured_vars)
             {
-                if( cap.second.defined_stack.empty() )
-                {
-                    unsigned index = new_locals.size();
-                    variable_rewrites.insert(std::make_pair( cap.first, index ));
-                    new_locals.push_back( monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first)) );
+                unsigned index = new_locals.size();
+                variable_rewrites.insert(std::make_pair( cap.first, index ));
+                new_locals.push_back( monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first)) );
 
-                    capture_usages.push_back(cap.second.usage);
-                    auto cap_ty = monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first));
-                    struct_ents.push_back(HIR::VisEnt<HIR::TypeRef> { HIR::Publicity::new_none(), cap_ty.clone() });
-                    capture_nodes.push_back(HIR::ExprNodeP(new ::HIR::ExprNode_Variable(sp, "", cap.first)));
-                    switch(cap.second.usage)
-                    {
-                    case ::HIR::ValueUsage::Unknown:
-                        BUG(sp, "Unexpected ValueUsage::Unknown on #" << cap.first);
-                    case ::HIR::ValueUsage::Move: {
-                        // No wrapping needed (drop handled by custom drop glue)
-                        } break;
-                    case ::HIR::ValueUsage::Borrow:
-                        capture_nodes.back()->m_res_type = cap_ty.clone();
-                        cap_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, mv$(cap_ty));
-                        struct_ents.back().ent = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, mv$(struct_ents.back().ent));
-                        capture_nodes.back() = HIR::ExprNodeP(new ::HIR::ExprNode_Borrow(sp, ::HIR::BorrowType::Shared, mv$(capture_nodes.back())));
-                        break;
-                    case ::HIR::ValueUsage::Mutate:
-                        capture_nodes.back()->m_res_type = cap_ty.clone();
-                        cap_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Unique, mv$(cap_ty));
-                        struct_ents.back().ent = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Unique, mv$(struct_ents.back().ent));
-                        capture_nodes.back() = HIR::ExprNodeP(new ::HIR::ExprNode_Borrow(sp, ::HIR::BorrowType::Unique, mv$(capture_nodes.back())));
-                        break;
-                    }
-                    capture_nodes.back()->m_res_type = mv$(cap_ty);
+                capture_usages.push_back(cap.second);
+                auto cap_ty = monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first));
+                struct_ents.push_back(HIR::VisEnt<HIR::TypeRef> { HIR::Publicity::new_none(), cap_ty.clone() });
+                capture_nodes.push_back(HIR::ExprNodeP(new ::HIR::ExprNode_Variable(sp, "", cap.first)));
+                switch(cap.second)
+                {
+                case ::HIR::ValueUsage::Unknown:
+                    BUG(sp, "Unexpected ValueUsage::Unknown on #" << cap.first);
+                case ::HIR::ValueUsage::Move: {
+                    // No wrapping needed (drop handled by custom drop glue)
+                    } break;
+                case ::HIR::ValueUsage::Borrow:
+                    capture_nodes.back()->m_res_type = cap_ty.clone();
+                    cap_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, mv$(cap_ty));
+                    struct_ents.back().ent = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, mv$(struct_ents.back().ent));
+                    capture_nodes.back() = HIR::ExprNodeP(new ::HIR::ExprNode_Borrow(sp, ::HIR::BorrowType::Shared, mv$(capture_nodes.back())));
+                    break;
+                case ::HIR::ValueUsage::Mutate:
+                    capture_nodes.back()->m_res_type = cap_ty.clone();
+                    cap_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Unique, mv$(cap_ty));
+                    struct_ents.back().ent = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Unique, mv$(struct_ents.back().ent));
+                    capture_nodes.back() = HIR::ExprNodeP(new ::HIR::ExprNode_Borrow(sp, ::HIR::BorrowType::Unique, mv$(capture_nodes.back())));
+                    break;
                 }
+                capture_nodes.back()->m_res_type = mv$(cap_ty);
             }
-            for(const auto& cap : ent.used_variables)
+            for(const auto& slot : node.m_avu_cache.local_vars)
             {
-                if( cap.second.defined_stack.empty() )
-                {
-                }
-                else
-                {
-                    unsigned index = new_locals.size();
-                    variable_rewrites.insert(std::make_pair( cap.first, index ));
-                    new_locals.push_back( monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first)) );
-                }
+                unsigned index = new_locals.size();
+                variable_rewrites.insert(std::make_pair( slot, index ));
+                new_locals.push_back( monomorph_cb.monomorph_type(sp, m_variable_types.at(slot)) );
             }
 
             // NOTE: Most of generator's lowering is done in MIR lowering
@@ -1392,7 +1226,10 @@ namespace {
                 void visit_pattern(const Span& sp, ::HIR::Pattern& pat) override
                 {
                     ::HIR::ExprVisitorDef::visit_pattern(sp, pat);
-                    visit_pattern_binding(sp, pat.m_binding);
+                    for(auto& pb : pat.m_bindings)
+                    {
+                        visit_pattern_binding(sp, pb);
+                    }
                     if(auto* pe = pat.m_data.opt_SplitSlice())
                     {
                         visit_pattern_binding(sp, pe->extra_bind);
@@ -1448,6 +1285,7 @@ namespace {
             // -- Prepare drop impl for later filling
             ::HIR::Function* fcn_drop_ptr; {
                 ::HIR::Function fcn_drop;
+                fcn_drop.m_receiver = HIR::Function::Receiver::BorrowUnique;
                 auto drop_self_arg_ty = ::HIR::TypeRef::new_path( ::HIR::GenericPath(gen_struct_path, impl_path_params.clone()), &gen_struct_ref );
                 drop_self_arg_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Unique, std::move(drop_self_arg_ty));
                 fcn_drop.m_args.push_back(std::make_pair( HIR::Pattern(), mv$(drop_self_arg_ty) ));
@@ -1501,335 +1339,20 @@ namespace {
         /// Newly defined variables
         void visit_pattern(const Span& sp, ::HIR::Pattern& pat) override
         {
-            if( !m_closure_stack.empty() )
-            {
-                add_closure_def_from_pattern(sp, pat);
-            }
         }
 
-        // Blocks need to track yields
-        void visit(::HIR::ExprNode_Block& node) override
-        {
-            GeneratorScope* scope = m_closure_stack.size() > 0 ? m_closure_stack.back().opt_Generator() : nullptr;
-            if(scope) {
-                scope->yield_stack.push_back(0);
-            }
-            ::HIR::ExprVisitorDef::visit(node);
-            if(scope) {
-                // NOTE: Have to get the pointer again (it might have changed due to inner push/pop)
-                scope = &m_closure_stack.back().as_Generator();
-                scope->yield_stack.pop_back();
-            }
-        }
         // Loops that contain yeild points require all referenced variables to be saved
         void visit(::HIR::ExprNode_Loop& node) override
         {
-            GeneratorScope* scope = m_closure_stack.size() > 0 ? m_closure_stack.back().opt_Generator() : nullptr;
-            if(scope) {
-                // 1. Determine if there's a yield within this
-                struct InnerVisitor: public ::HIR::ExprVisitorDef
-                {
-                    bool m_has_yield = false;
-
-                    void visit(::HIR::ExprNode_Closure& ) override
-                    {
-                        // Ignore inner closures (yields can't pass them)
-                    }
-                    void visit(::HIR::ExprNode_Generator& ) override
-                    {
-                        // Ignore inner generators (yields can't pass them)
-                    }
-                    void visit(::HIR::ExprNode_Yield& node) override
-                    {
-                        m_has_yield = true;
-                        // Don't bother recursing, we've found a yield
-                    }
-                } v;
-                v.visit_node_ptr(node.m_code);
-
-                // 2. If so, push `STACK_MARKER_LOOP`
-                if( v.m_has_yield ) {
-                    DEBUG("Loop with inner yield");
-                    scope->yield_stack.push_back(GeneratorScope::STACK_MARKER_LOOP);
-                }
-                else {
-                    // Clear `scope` to prevent the pop
-                    DEBUG("Loop without inner yield");
-                    scope = nullptr;
-                }
-            }
             ::HIR::ExprVisitorDef::visit(node);
-            if(scope) {
-                // NOTE: Have to get the pointer again (it might have changed due to inner push/pop)
-                scope = &m_closure_stack.back().as_Generator();
-                scope->yield_stack.pop_back();
-            }
         }
         void visit(::HIR::ExprNode_Yield& node) override
         {
             ::HIR::ExprVisitorDef::visit(node);
-
-            // `yield`: Increase all stack entries that don't correspond to a loop
-            GeneratorScope* scope = m_closure_stack.size() > 0 ? m_closure_stack.back().opt_Generator() : nullptr;
-            if(scope)
-            {
-                for(size_t i = 0; i < scope->yield_stack.size(); i ++)
-                {
-                    if(scope->yield_stack[i] != GeneratorScope::STACK_MARKER_LOOP) {
-                        // Assert that adding 1 won't overflow (... that'd be >65k yield statements)
-                        assert(scope->yield_stack[i] < GeneratorScope::STACK_MARKER_LOOP-1);
-                        scope->yield_stack[i] += 1;
-                    }
-                }
-                DEBUG("yield stack=[" << scope->yield_stack << "]");
-            }
-        }
-
-        /// Used variables get marked in the stack
-        void visit(::HIR::ExprNode_Variable& node) override
-        {
-            DEBUG("_Variable: #" << node.m_slot << " '" << node.m_name << "' " << node.m_usage);
-            if( !m_closure_stack.empty() )
-            {
-                mark_used_variable(node.span(), node.m_slot, node.m_usage);
-            }
-            ::HIR::ExprVisitorDef::visit(node);
-        }
-
-        /// CallValue needs handling when calling closures (pre-calculated value usage isn't correct)
-        void visit(::HIR::ExprNode_CallValue& node) override
-        {
-            const auto& fcn_ty = node.m_value->m_res_type;
-            DEBUG("_CallValue - " << fcn_ty);
-            if( !m_closure_stack.empty() )
-            {
-                TRACE_FUNCTION_F("_CallValue");
-                if( node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::Unknown )
-                {
-                    if( fcn_ty.data().is_Closure() )
-                    {
-                        const auto& cn = *fcn_ty.data().as_Closure().node;
-                        // Use the closure's class to determine if & or &mut should be taken (and which function to use)
-                        ::HIR::ValueUsage   vu = ::HIR::ValueUsage::Unknown;
-                        switch(cn.m_class)
-                        {
-                        case ::HIR::ExprNode_Closure::Class::Unknown:
-                        case ::HIR::ExprNode_Closure::Class::NoCapture:
-                        case ::HIR::ExprNode_Closure::Class::Shared:
-                            vu = ::HIR::ValueUsage::Borrow;
-                            break;
-                        case ::HIR::ExprNode_Closure::Class::Mut:
-                            vu = ::HIR::ValueUsage::Mutate;
-                            break;
-                        case ::HIR::ExprNode_Closure::Class::Once:
-                            vu = ::HIR::ValueUsage::Move;
-                            break;
-                        }
-                        node.m_value->m_usage = vu;
-                    }
-                    else
-                    {
-                        // Must be a function pointer, leave it
-                    }
-                }
-                else
-                {
-                    // If the trait is known, then the &/&mut has been added
-                }
-                ::HIR::ExprVisitorDef::visit(node);
-            }
-            else if( fcn_ty.data().is_Closure() )
-            {
-                //TODO(node.span(), "Determine how value in CallValue is used on a closure");
-                ::HIR::ExprVisitorDef::visit(node);
-            }
-            else
-            {
-                ::HIR::ExprVisitorDef::visit(node);
-            }
         }
 
     private:
-        void add_var_def_closure(const Span& sp, ClosureScope& e, unsigned int slot)
-        {
-            auto it = ::std::lower_bound(e.local_vars.begin(), e.local_vars.end(), slot);
-            if( it == e.local_vars.end() || *it != slot ) {
-                e.local_vars.insert(it, slot);
-            }
-        }
-        void add_var_def_generator(const Span& sp, GeneratorScope& scope, unsigned int slot)
-        {
-            auto& e = scope.used_variables[slot];
-            DEBUG("_Variable: #" << slot << " '?' stack=[" << scope.yield_stack << "]");
-            e.defined_stack = scope.yield_stack;
-        }
-
-        void add_var_def(const Span& sp, unsigned int slot)
-        {
-            assert(m_closure_stack.size() > 0);
-            auto& ent = m_closure_stack.back();
-            TU_MATCH_HDRA( (ent), {)
-            TU_ARMA(None, e) throw "";
-            TU_ARMA(Closure, e) {
-                add_var_def_closure(sp, e, slot);
-                }
-            TU_ARMA(Generator, e) {
-                add_var_def_generator(sp, e, slot);
-                }
-            }
-        }
-        void add_closure_def_from_pattern(const Span& sp, const ::HIR::Pattern& pat)
-        {
-            // Add binding indexes to m_closure_defs
-            if( pat.m_binding.is_valid() ) {
-                const auto& pb = pat.m_binding;
-                add_var_def(sp, pb.m_slot);
-            }
-
-            // Recurse
-            TU_MATCH_HDRA((pat.m_data), {)
-            TU_ARMA(Any, e) {
-                }
-            TU_ARMA(Value, e) {
-                }
-            TU_ARMA(Range, e) {
-                }
-            TU_ARMA(Box, e) {
-                add_closure_def_from_pattern(sp, *e.sub);
-                }
-            TU_ARMA(Ref, e) {
-                add_closure_def_from_pattern(sp, *e.sub);
-                }
-            TU_ARMA(Tuple, e) {
-                for( const auto& subpat : e.sub_patterns )
-                    add_closure_def_from_pattern(sp, subpat);
-                }
-            TU_ARMA(SplitTuple, e) {
-                for( const auto& subpat : e.leading )
-                    add_closure_def_from_pattern(sp, subpat);
-                for( const auto& subpat : e.trailing )
-                    add_closure_def_from_pattern(sp, subpat);
-                }
-            TU_ARMA(Slice, e) {
-                for(const auto& sub : e.sub_patterns)
-                    add_closure_def_from_pattern(sp, sub);
-                }
-            TU_ARMA(SplitSlice, e) {
-                for(const auto& sub : e.leading)
-                    add_closure_def_from_pattern( sp, sub );
-                for(const auto& sub : e.trailing)
-                    add_closure_def_from_pattern( sp, sub );
-                if( e.extra_bind.is_valid() ) {
-                    add_var_def(sp, e.extra_bind.m_slot);
-                }
-                }
-
-            // - Enums/Structs
-            TU_ARMA(PathValue, e) {
-                }
-            TU_ARMA(PathTuple, e) {
-                for(const auto& field : e.leading) {
-                    add_closure_def_from_pattern(sp, field);
-                }
-                for(const auto& field : e.trailing) {
-                    add_closure_def_from_pattern(sp, field);
-                }
-                }
-            TU_ARMA(PathNamed, e) {
-                for( auto& field_pat : e.sub_patterns ) {
-                    add_closure_def_from_pattern(sp, field_pat.second);
-                }
-                }
-            }
-        }
-        /// Update usage depending on the type
-        ::HIR::ValueUsage get_real_usage(const Span& sp, unsigned int slot, ::HIR::ValueUsage usage)
-        {
-            // If the usage is move, update it depending on the type
-            if( usage == ::HIR::ValueUsage::Move )
-            {
-                // Copy types just need a borrow
-                if( m_resolve.type_is_copy(sp, m_variable_types.at(slot)) ) {
-                    usage = ::HIR::ValueUsage::Borrow;
-                }
-                // `&mut` types get re-borrowed
-                // - The reborrow pass is AFTER this pass
-                else if( m_variable_types.at(slot).data().is_Borrow() && m_variable_types.at(slot).data().as_Borrow().type == ::HIR::BorrowType::Unique ) {
-                    usage = ::HIR::ValueUsage::Mutate;
-                }
-                else {
-                }
-            }
-            return usage;
-        }
-        void mark_used_variable_closure(const Span& sp, ClosureScope& closure_rec, unsigned int slot, ::HIR::ValueUsage usage)
-        {
-            const auto& closure_defs = closure_rec.local_vars;
-            auto& closure = closure_rec.node;
-
-            if( ::std::binary_search(closure_defs.begin(), closure_defs.end(), slot) ) {
-                // Ignore, this is local to the current closure
-                return ;
-            }
-
-            usage = get_real_usage(sp, slot, usage);
-
-            auto it = ::std::lower_bound(closure_rec.captured_vars.begin(), closure_rec.captured_vars.end(), slot, [](const auto& a, const auto& b){ return a.first < b; });
-            if( it == closure_rec.captured_vars.end() || it->first != slot ) {
-                closure_rec.captured_vars.insert( it, ::std::make_pair(slot, usage) );
-            }
-            else {
-                it->second = ::std::max(it->second, usage);
-            }
-
-            const char* cap_type_name = "?";
-            switch( usage )
-            {
-            case ::HIR::ValueUsage::Unknown:
-                BUG(sp, "Unknown usage of variable " << slot);
-            case ::HIR::ValueUsage::Borrow:
-                cap_type_name = "Borrow";
-                closure.m_class = ::std::max(closure.m_class, ::HIR::ExprNode_Closure::Class::Shared);
-                break;
-            case ::HIR::ValueUsage::Mutate:
-                cap_type_name = "Mutate";
-                closure.m_class = ::std::max(closure.m_class, ::HIR::ExprNode_Closure::Class::Mut);
-                break;
-            case ::HIR::ValueUsage::Move:
-                //if( m_resolve.type_is_copy( sp, m_variable_types.at(slot) ) ) {
-                //    closure.m_class = ::std::max(closure.m_class, ::HIR::ExprNode_Closure::Class::Shared);
-                //}
-                //else {
-                    cap_type_name = "Move";
-                    closure.m_class = ::std::max(closure.m_class, ::HIR::ExprNode_Closure::Class::Once);
-                //}
-                break;
-            }
-            DEBUG("Captured " << slot << " - " << m_variable_types.at(slot) << " :: " << cap_type_name);
-        }
-        void mark_used_variable_generator(const Span& sp, GeneratorScope& scope, unsigned int slot, ::HIR::ValueUsage usage)
-        {
-            auto& e = scope.used_variables[slot];
-            e.last_used_stack = scope.yield_stack;
-            e.usage = std::max(e.usage, get_real_usage(sp, slot, usage));
-            DEBUG("Used #" << slot << " :: stack=[" << e.last_used_stack << "]");
-        }
-        void mark_used_variable(const Span& sp, unsigned int slot, ::HIR::ValueUsage usage)
-        {
-            assert(m_closure_stack.size() > 0);
-            auto& ent = m_closure_stack.back();
-            TU_MATCH_HDRA( (ent), {)
-            TU_ARMA(None, e) throw "";
-            TU_ARMA(Closure, e) {
-                mark_used_variable_closure(sp, e, slot, usage);
-                }
-            TU_ARMA(Generator, e) {
-                mark_used_variable_generator(sp, e, slot, usage);
-                }
-            }
-        }
     };
-    const unsigned ExprVisitor_Extract::GeneratorScope::STACK_MARKER_LOOP = ~0u;
 
     /// <summary>
     /// Top-level visitor

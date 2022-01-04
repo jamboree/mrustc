@@ -10,6 +10,8 @@
 #include <hir/hir.hpp>
 #include "common.hpp"
 #include "impl_ref.hpp"
+#include <range_vec_map.hpp>
+#include "resolve_common.hpp"
 
 enum class MetadataType {
     Unknown,    // Unknown still
@@ -30,31 +32,10 @@ static inline std::ostream& operator<<(std::ostream& os, const MetadataType& x) 
     return os << "?";
 }
 
-class StaticTraitResolve
+
+class StaticTraitResolve:
+    public TraitResolveCommon
 {
-public:
-    const ::HIR::Crate&   m_crate;
-
-    const ::HIR::GenericParams*   m_impl_generics;
-    const ::HIR::GenericParams*   m_item_generics;
-
-
-    ::std::map< ::HIR::TypeRef, ::HIR::TypeRef> m_type_equalities;
-    // A pre-calculated list of trait bounds
-    ::std::set< std::pair< ::HIR::TypeRef, ::HIR::TraitPath> > m_trait_bounds;
-
-    ::HIR::SimplePath   m_lang_Copy;
-    ::HIR::SimplePath   m_lang_Clone;   // 1.29
-    ::HIR::SimplePath   m_lang_Drop;
-    ::HIR::SimplePath   m_lang_Sized;
-    ::HIR::SimplePath   m_lang_Unsize;
-    ::HIR::SimplePath   m_lang_Fn;
-    ::HIR::SimplePath   m_lang_FnMut;
-    ::HIR::SimplePath   m_lang_FnOnce;
-    ::HIR::SimplePath   m_lang_Box;
-    ::HIR::SimplePath   m_lang_PhantomData;
-
-private:
     mutable ::std::map< ::HIR::TypeRef, bool >  m_copy_cache;
     mutable ::std::map< ::HIR::TypeRef, bool >  m_clone_cache;
     mutable ::std::map< ::HIR::TypeRef, bool >  m_drop_cache;
@@ -62,42 +43,19 @@ private:
 
 public:
     StaticTraitResolve(const ::HIR::Crate& crate):
-        m_crate(crate),
-        m_impl_generics(nullptr),
-        m_item_generics(nullptr)
+        TraitResolveCommon(crate)
     {
-        m_lang_Copy = m_crate.get_lang_item_path_opt("copy");
-        if( TARGETVER_LEAST_1_29 )
-            m_lang_Clone = m_crate.get_lang_item_path_opt("clone");
-        m_lang_Drop = m_crate.get_lang_item_path_opt("drop");
-        m_lang_Sized = m_crate.get_lang_item_path_opt("sized");
-        m_lang_Unsize = m_crate.get_lang_item_path_opt("unsize");
-        m_lang_Fn = m_crate.get_lang_item_path_opt("fn");
-        m_lang_FnMut = m_crate.get_lang_item_path_opt("fn_mut");
-        m_lang_FnOnce = m_crate.get_lang_item_path_opt("fn_once");
-        m_lang_Box = m_crate.get_lang_item_path_opt("owned_box");
-        m_lang_PhantomData = m_crate.get_lang_item_path_opt("phantom_data");
     }
 
 private:
-    void prep_indexes();
-    void prep_indexes__add_equality(const Span& sp, ::HIR::TypeRef long_ty, ::HIR::TypeRef short_ty);
-    void prep_indexes__add_trait_bound(const Span& sp, ::HIR::TypeRef type, ::HIR::TraitPath trait_path);
-
+    void prep_indexes() {
+        m_copy_cache.clear();
+        m_clone_cache.clear();
+        m_drop_cache.clear();
+        m_aty_cache.clear();
+        TraitResolveCommon::prep_indexes(Span());
+    }
 public:
-    bool has_self() const {
-        return m_impl_generics ? true : false;
-    }
-    const ::HIR::GenericParams& impl_generics() const {
-        static ::HIR::GenericParams empty;
-        return m_impl_generics ? *m_impl_generics : empty;
-    }
-    const ::HIR::GenericParams& item_generics() const {
-        static ::HIR::GenericParams empty;
-        return m_item_generics ? *m_item_generics : empty;
-    }
-
-    const ::HIR::TypeRef& get_const_param_type(const Span& sp, unsigned binding) const;
 
     /// \brief State manipulation
     /// \{
@@ -127,6 +85,18 @@ public:
         m_item_generics = nullptr;
         prep_indexes();
     }
+    void set_both_generics_raw(const ::HIR::GenericParams* gps_impl, const ::HIR::GenericParams* gps_fcn) {
+        assert( !m_impl_generics );
+        assert( !m_item_generics );
+        m_impl_generics = gps_impl;
+        m_item_generics = gps_fcn;
+        prep_indexes();
+    }
+    void clear_both_generics() {
+        m_impl_generics = nullptr;
+        m_item_generics = nullptr;
+        prep_indexes();
+    }
     /// \}
 
     /// \brief Lookups
@@ -151,13 +121,11 @@ public:
         ) const;
 
 private:
-    bool find_impl__check_bound(
+    bool find_impl__bounds(
         const Span& sp,
         const ::HIR::SimplePath& trait_path, const ::HIR::PathParams* trait_params,
         const ::HIR::TypeRef& type,
-        t_cb_find_impl found_cb,
-        //const ::HIR::GenericBound& bound
-        const ::std::pair< ::HIR::TypeRef, ::HIR::TraitPath>& bound
+        t_cb_find_impl found_cb
         ) const;
     bool find_impl__check_crate(
         const Span& sp,
@@ -181,6 +149,7 @@ private:
 public:
 
     void expand_associated_types(const Span& sp, ::HIR::TypeRef& input) const;
+    void expand_associated_types_path(const Span& sp, ::HIR::Path& input) const;
     bool expand_associated_types_single(const Span& sp, ::HIR::TypeRef& input) const;
 
     // Helper: Run monomorphise+EAT if the type contains generics
@@ -207,9 +176,6 @@ private:
 
 public:
     /// \}
-
-    /// Iterate over in-scope bounds (function then top)
-    bool iterate_bounds( ::std::function<bool(const ::HIR::GenericBound&)> cb) const;
 
     /// Locate a named trait in the provied trait (either itself or as a parent trait)
     bool find_named_trait_in_trait(const Span& sp,
@@ -260,6 +226,6 @@ public:
     );
 
     /// `signature_only` - Returns a pointer to an item with the correct signature, not the actual implementation (faster)
-    ValuePtr get_value(const Span& sp, const ::HIR::Path& p, MonomorphState& out_params, bool signature_only=false) const;
+    ValuePtr get_value(const Span& sp, const ::HIR::Path& p, MonomorphState& out_params, bool signature_only=false, const HIR::GenericParams** out_impl_params_def=nullptr) const;
 };
 

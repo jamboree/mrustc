@@ -84,7 +84,7 @@ namespace {
         }
         void visit(::HIR::ExprNode_Asm& node) override
         {
-            TRACE_FUNCTION_F(&node << " asm! ...");
+            TRACE_FUNCTION_F(&node << " llvm_asm! ...");
 
             // TODO: Check result types
             for(auto& v : node.m_outputs)
@@ -94,6 +94,29 @@ namespace {
             for(auto& v : node.m_inputs)
             {
                 v.value->visit(*this);
+            }
+        }
+        void visit(::HIR::ExprNode_Asm2& node) override
+        {
+            TRACE_FUNCTION_F(&node << " asm! ...");
+
+            // TODO: Check result types
+            for(auto& v : node.m_params)
+            {
+                TU_MATCH_HDRA( (v), { )
+                TU_ARMA(Const, e) {
+                    visit_node_ptr(e);
+                    }
+                TU_ARMA(Sym, e) {
+                    }
+                TU_ARMA(RegSingle, e) {
+                    visit_node_ptr(e.val);
+                    }
+                TU_ARMA(Reg, e) {
+                    if(e.val_in)    visit_node_ptr(e.val_in);
+                    if(e.val_out)   visit_node_ptr(e.val_out);
+                    }
+                }
             }
         }
         void visit(::HIR::ExprNode_Return& node) override
@@ -309,6 +332,12 @@ namespace {
             check_types_equal(node.span(), node.m_res_type, ::HIR::TypeRef::new_borrow(node.m_type, node.m_value->m_res_type.clone()));
             node.m_value->visit( *this );
         }
+        void visit(::HIR::ExprNode_RawBorrow& node) override
+        {
+            TRACE_FUNCTION_F(&node << " &raw _ ...");
+            check_types_equal(node.span(), node.m_res_type, ::HIR::TypeRef::new_pointer(node.m_type, node.m_value->m_res_type.clone()));
+            node.m_value->visit( *this );
+        }
         void visit(::HIR::ExprNode_Index& node) override
         {
             TRACE_FUNCTION_F(&node << " ... [ ... ]");
@@ -322,8 +351,10 @@ namespace {
 
         void visit(::HIR::ExprNode_Cast& node) override
         {
-            TRACE_FUNCTION_F(&node << " ... as " << node.m_res_type);
+            TRACE_FUNCTION_F(&node << " " << node.m_value->m_res_type << " as " << node.m_dst_type);
             const Span& sp = node.span();
+            DEBUG("Cast res type " << node.m_res_type);
+            //ASSERT_BUG(node.span(), node.m_res_type == node.m_dst_type, node.m_res_type << " != " << node.m_dst_type);
 
             const auto& src_ty = node.m_value->m_res_type;
             const auto& dst_ty = node.m_res_type;
@@ -421,6 +452,10 @@ namespace {
             {
                 ASSERT_BUG(sp, dst_ty.data().is_Slice(), "");
                 ASSERT_BUG(sp, node.m_usage == ::HIR::ValueUsage::Unknown, "");
+            }
+            else if( src_ty.data().is_Diverge() )
+            {
+                // Perfectly valid. (! can become anything)
             }
             else if( src_ty == dst_ty )
             {
@@ -668,19 +703,9 @@ namespace {
             )
         }
 
-        void visit(::HIR::ExprNode_CallPath& node) override
+        void check_function(const Span& sp, const ::HIR::Path& path, HIR::ExprCallCache& cache)
         {
-            const auto& sp = node.span();
-            TRACE_FUNCTION_F(&node << " " << node.m_path << "(..., )");
-
-            for( auto& val : node.m_args ) {
-                val->visit( *this );
-            }
-
             // Do function resolution again, this time with concrete types.
-            const auto& path = node.m_path;
-            /*const*/ auto& cache = node.m_cache;
-
             const ::HIR::Function*  fcn_ptr = nullptr;
             MonomorphStatePtr   monomorph_cb;
 
@@ -762,40 +787,23 @@ namespace {
             }
             DEBUG("Ret " << fcn.m_return);
             // Replace ErasedType and monomorphise
-            cache.m_arg_types.push_back( clone_ty_with(sp, fcn.m_return, [&](const auto& tpl, auto& rv)->bool {
-                if( tpl.data().is_Infer() ) {
-                    BUG(sp, "");
-                }
-                else if( tpl.data().is_Generic() ) {
-                    rv = monomorph_cb.get_type(sp, tpl.data().as_Generic()).clone();
-                    return true;
-                }
-                else if( this->expand_erased_types && tpl.data().is_ErasedType() ) {
-                    const auto& e = tpl.data().as_ErasedType();
+            cache.m_arg_types.push_back( monomorph_cb.monomorph_type(sp, fcn.m_return, false) );
+            visit_ty_with_mut(cache.m_arg_types.back(), [&](HIR::TypeRef& ty)->bool {
+                if( this->expand_erased_types && ty.data().is_ErasedType() ) {
+                    const auto& e = ty.data().as_ErasedType();
 
-                    ASSERT_BUG(sp, e.m_index < fcn_ptr->m_code.m_erased_types.size(), "");
-                    const auto& erased_type_replacement = fcn_ptr->m_code.m_erased_types.at(e.m_index);
-                    rv = monomorph_cb.monomorph_type(sp, erased_type_replacement, false);
-                    return true;
+                    // Check the origin, because monomorph might end up introducing other erased types
+                    if(e.m_origin == path) {
+                        ASSERT_BUG(sp, e.m_index < fcn_ptr->m_code.m_erased_types.size(), "");
+                        const auto& erased_type_replacement = fcn_ptr->m_code.m_erased_types.at(e.m_index);
+                        ty = monomorph_cb.monomorph_type(sp, erased_type_replacement, false);
+                        return true;
+                    }
                 }
-                else {
-                    return false;
-                }
-                }) );
+                return false;
+                });
             m_resolve.expand_associated_types(sp, cache.m_arg_types.back());
             DEBUG("= " << cache.m_arg_types.back());
-
-            // Check types
-            for(unsigned int i = 0; i < fcn.m_args.size(); i ++) {
-                DEBUG("CHECK ARG " << i << " " << node.m_cache.m_arg_types[i] << " == " << node.m_args[i]->m_res_type);
-                check_types_equal(node.span(), node.m_cache.m_arg_types[i], node.m_args[i]->m_res_type);
-            }
-            for(unsigned int i = fcn.m_args.size(); i < node.m_args.size(); i ++) {
-                DEBUG("CHECK ARG " << i << " *  == " << node.m_args[i]->m_res_type);
-                // TODO: Check that the types here are valid.
-            }
-            DEBUG("CHECK RV " << node.m_res_type << " == " << node.m_cache.m_arg_types.back());
-            check_types_equal(node.span(), node.m_res_type,  node.m_cache.m_arg_types.back());
 
             cache.m_monomorph.reset( new MonomorphStatePtr(monomorph_cb) );
 
@@ -844,6 +852,30 @@ namespace {
                     }
                 }
             }
+        }
+
+        void visit(::HIR::ExprNode_CallPath& node) override
+        {
+            const auto& sp = node.span();
+            TRACE_FUNCTION_F(&node << " " << node.m_path << "(..., )");
+
+            for( auto& val : node.m_args ) {
+                val->visit( *this );
+            }
+
+            check_function(sp, node.m_path, node.m_cache);
+
+            // Check types
+            for(unsigned int i = 0; i < node.m_cache.m_arg_types.size()-1; i ++) {
+                DEBUG("CHECK ARG " << i << " " << node.m_cache.m_arg_types[i] << " == " << node.m_args[i]->m_res_type);
+                check_types_equal(sp, node.m_cache.m_arg_types[i], node.m_args[i]->m_res_type);
+            }
+            for(unsigned int i = node.m_cache.m_arg_types.size()-1; i < node.m_args.size(); i ++) {
+                DEBUG("CHECK ARG " << i << " *  == " << node.m_args[i]->m_res_type);
+                // TODO: Check that the types here are valid.
+            }
+            DEBUG("CHECK RV " << node.m_res_type << " == " << node.m_cache.m_arg_types.back());
+            check_types_equal(sp, node.m_res_type,  node.m_cache.m_arg_types.back());
         }
         void visit(::HIR::ExprNode_CallValue& node) override
         {
@@ -911,20 +943,26 @@ namespace {
         void visit(::HIR::ExprNode_CallMethod& node) override
         {
             TRACE_FUNCTION_F(&node << " (...)." << node.m_method << "(...,) - " << node.m_method_path);
-            // TODO: Don't use m_cache
-            ASSERT_BUG(node.span(), node.m_cache.m_arg_types.size() > 0, "CallMethod cache not populated");
-            ASSERT_BUG(node.span(), node.m_cache.m_arg_types.size() == 1 + node.m_args.size() + 1, "CallMethod cache mis-sized");
-            check_types_equal(node.m_cache.m_arg_types[0], node.m_value);
-            for(unsigned int i = 0; i < node.m_args.size(); i ++)
-            {
-                check_types_equal(node.m_cache.m_arg_types[1+i], node.m_args[i]);
-            }
-            check_types_equal(node.span(), node.m_res_type, node.m_cache.m_arg_types.back());
 
             node.m_value->visit( *this );
             for( auto& val : node.m_args ) {
                 val->visit( *this );
             }
+
+            const Span& sp = node.span();
+            check_function(sp, node.m_method_path, node.m_cache);
+
+            // Check types
+            for(unsigned int i = 0; i < node.m_cache.m_arg_types.size()-2; i ++) {
+                DEBUG("CHECK ARG " << i << " " << node.m_cache.m_arg_types[1+i] << " == " << node.m_args[i]->m_res_type);
+                check_types_equal(sp, node.m_cache.m_arg_types[1+i], node.m_args[i]->m_res_type);
+            }
+            for(unsigned int i = node.m_cache.m_arg_types.size()-1; i < node.m_args.size(); i ++) {
+                DEBUG("CHECK ARG " << i << " *  == " << node.m_args[i]->m_res_type);
+                // TODO: Check that the types here are valid.
+            }
+            DEBUG("CHECK RV " << node.m_res_type << " == " << node.m_cache.m_arg_types.back());
+            check_types_equal(sp, node.m_res_type,  node.m_cache.m_arg_types.back());
         }
 
         void visit(::HIR::ExprNode_Field& node) override
@@ -993,14 +1031,17 @@ namespace {
         }
         void visit(::HIR::ExprNode_ArraySized& node) override
         {
-            TRACE_FUNCTION_F(&node << " [...; "<<node.m_size_val<<"]");
+            TRACE_FUNCTION_F(&node << " [...; " << node.m_size << "]");
 
             //check_types_equal(node.m_size->span(), ::HIR::TypeRef(::HIR::Primitive::Usize), node.m_size->m_res_type);
             const auto& inner_ty = node.m_res_type.data().as_Array().inner;
             check_types_equal(node.m_val->span(), inner_ty, node.m_val->m_res_type);
 
             node.m_val->visit( *this );
-            node.m_size->visit( *this );
+            //if(node.m_size.is_Unevaluated() && node.m_size.as_Unevaluated().is_Unevaluated())
+            //{
+            //    (*node.m_size.as_Unevaluated().as_Unevaluated())->visit( *this );
+            //}
         }
 
         void visit(::HIR::ExprNode_Literal& node) override
@@ -1154,15 +1195,16 @@ namespace {
                 const ::HIR::SimplePath& trait, const ::HIR::PathParams& params, const ::HIR::TypeRef& ity, const char* name
             ) const
         {
-            if( trait == m_lang_Index && ity.data().is_Array() ) {
-                if(name)
-                {
-                    if( res != ity.data().as_Array().inner ) {
-                        ERROR(sp, E0000, "Associated type on " << trait << params << " for " << ity << " doesn't match - " << res << " != " << ity.data().as_Array().inner);
-                    }
-                }
-                return ;
-            }
+            DEBUG(sp << " - " << res << " == < " << ity << " as " << trait << params << " >::" << name);
+            //if( trait == m_lang_Index && ity.data().is_Array() ) {
+            //    if(name && params.m_types.)
+            //    {
+            //        if( res != ity.data().as_Array().inner ) {
+            //            ERROR(sp, E0000, "Associated type on " << trait << params << " for " << ity << " doesn't match - " << res << " != " << ity.data().as_Array().inner);
+            //        }
+            //    }
+            //    return ;
+            //}
             bool found = m_resolve.find_impl(sp, trait, &params, ity, [&](auto impl, bool fuzzy) {
                 if( name )
                 {
@@ -1227,8 +1269,8 @@ namespace {
                 this->check_pattern_value(sp, pe.val, ty);
                 }
             TU_ARMA(Range, pe) {
-                this->check_pattern_value(sp, pe.start, ty);
-                this->check_pattern_value(sp, pe.end, ty);
+                if(pe.start)    this->check_pattern_value(sp, *pe.start, ty);
+                if(pe.end  )    this->check_pattern_value(sp, *pe.end, ty);
                 }
             TU_ARMA(Slice, e) {
                 // TODO: Check that the type is a Slice or Array
@@ -1237,6 +1279,11 @@ namespace {
             TU_ARMA(SplitSlice, e) {
                 // TODO: Check that the type is a Slice or Array
                 // - Array must have compatible size
+                }
+            
+            TU_ARMA(Or, e) {
+                for(auto& subpat : e)
+                    check_pattern(subpat, ty);
                 }
             }
         }
@@ -1261,7 +1308,8 @@ namespace {
                 check_types_equal(sp, ty, ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ::HIR::CoreType::Str));
                 }
             TU_ARMA(ByteString, e) {
-                check_types_equal(sp, ty, ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ::HIR::TypeRef::new_slice(::HIR::CoreType::U8)));
+                // Can either be a slice or an array
+                //check_types_equal(sp, ty, ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ::HIR::TypeRef::new_slice(::HIR::CoreType::U8)));
                 }
             TU_ARMA(Named, e) {
                 MonomorphState  ms;
@@ -1302,11 +1350,13 @@ namespace {
             {
                 this->visit_type( e->inner );
                 DEBUG("Array size " << ty);
-                if( auto* se = e->size.opt_Unevaluated() ) {
-                    t_args  tmp;
-                    auto ty_usize = ::HIR::TypeRef(::HIR::CoreType::Usize);
-                    ExprVisitor_Validate    ev(m_resolve, tmp, ty_usize);
-                    ev.visit_root( **se );
+                if( auto* se1 = e->size.opt_Unevaluated() ) {
+                    if( auto* se = se1->opt_Unevaluated() ) {
+                        t_args  tmp;
+                        auto ty_usize = ::HIR::TypeRef(::HIR::CoreType::Usize);
+                        ExprVisitor_Validate    ev(m_resolve, tmp, ty_usize);
+                        ev.visit_root( **se );
+                    }
                 }
             }
             else {

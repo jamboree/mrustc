@@ -56,6 +56,8 @@ ExprNodeP Parse_ExprBlockNode(TokenStream& lex, bool is_unsafe/*=false*/, Ident 
     ::std::vector<ExprNodeP> nodes;
     AST::AttributeList  attrs;
 
+
+    auto orig_module = lex.parse_state().module;
     ::std::shared_ptr<AST::Module> local_mod;
 
     if( LOOK_AHEAD(lex) == TOK_INTERPOLATED_BLOCK )
@@ -91,6 +93,10 @@ ExprNodeP Parse_ExprBlockNode(TokenStream& lex, bool is_unsafe/*=false*/, Ident 
     }
     GET_CHECK_TOK(tok, lex, TOK_BRACE_CLOSE);
 
+    if( lex.parse_state().module != orig_module ) {
+        DEBUG("Restore module from " << lex.parse_state().module->path() << " to " << orig_module->path() );
+        lex.parse_state().module = orig_module;
+    }
     auto* rv_blk = new ::AST::ExprNode_Block(is_unsafe, last_value_yielded, mv$(nodes), mv$(local_mod) );
     rv_blk->m_label = label;
     auto rv = ExprNodeP(rv_blk);
@@ -113,6 +119,8 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
         PUTBACK(tok, lex);
         if( !local_mod ) {
             local_mod = lex.parse_state().get_current_mod().add_anon();
+            DEBUG("Set module from " << lex.parse_state().module->path() << " to " << local_mod->path() );
+            lex.parse_state().module = local_mod.get();
         }
         Parse_Mod_Item(lex, *local_mod, mv$(item_attrs));
         return ExprNodeP();
@@ -124,12 +132,18 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
         // - Allows correct scoping of defined macros
         if( !local_mod ) {
             local_mod = lex.parse_state().get_current_mod().add_anon();
+            DEBUG("Set module from " << lex.parse_state().module->path() << " to " << local_mod->path() );
+            lex.parse_state().module = local_mod.get();
         }
     }
 
     switch(tok.type())
     {
     // Items:
+    case TOK_RWORD_CRATE:
+        if( lex.lookahead(0) == TOK_DOUBLE_COLON ) {
+            break;
+        }
     case TOK_INTERPOLATED_VIS:
     case TOK_INTERPOLATED_ITEM:
     case TOK_RWORD_PUB:
@@ -149,6 +163,8 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
         PUTBACK(tok, lex);
         if( !local_mod ) {
             local_mod = lex.parse_state().get_current_mod().add_anon();
+            DEBUG("Set module from " << lex.parse_state().module->path() << " to " << local_mod->path() );
+            lex.parse_state().module = local_mod.get();
         }
         Parse_Mod_Item(lex, *local_mod, mv$(item_attrs));
         return ExprNodeP();
@@ -159,26 +175,28 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
             PUTBACK(tok, lex);
             if( !local_mod ) {
                 local_mod = lex.parse_state().get_current_mod().add_anon();
+                DEBUG("Set module from " << lex.parse_state().module->path() << " to " << local_mod->path() );
+                lex.parse_state().module = local_mod.get();
             }
             Parse_Mod_Item(lex, *local_mod, mv$(item_attrs));
             return ExprNodeP();
         }
         // fall
-    default: {
-        PUTBACK(tok, lex);
-        auto rv = Parse_ExprBlockLine(lex, &add_silence_if_end);
-        if( rv ) {
-            rv->set_attrs( mv$(item_attrs) );
-        }
-        else if( item_attrs.m_items.size() > 0 ) {
-            // TODO: Is this an error? - Attributes on a expression that didn't yeild a node.
-            // - They should have applied to the item that was parsed?
-        }
-        else {
-        }
-        return rv;
-        } break;
+    default:
+        break;
     }
+    PUTBACK(tok, lex);
+    auto rv = Parse_ExprBlockLine(lex, &add_silence_if_end);
+    if( rv ) {
+        rv->set_attrs( mv$(item_attrs) );
+    }
+    else if( item_attrs.m_items.size() > 0 ) {
+        // TODO: Is this an error? - Attributes on a expression that didn't yeild a node.
+        // - They should have applied to the item that was parsed?
+    }
+    else {
+    }
+    return rv;
 }
 
 /// Parse a single line from a block
@@ -225,6 +243,29 @@ ExprNodeP Parse_ExprBlockLine(TokenStream& lex, bool *add_silence)
     }
     else
     {
+        // HACK: Parse a path and look for a `macro::path! { }`, so it can be parsed as a block (instead of as an expression)
+        // NOTE: This means that here is where the path parsing code ends up
+        switch(tok.type())
+        {
+        case TOK_IDENT:
+        case TOK_RWORD_CRATE:
+        case TOK_RWORD_SUPER:
+        case TOK_DOUBLE_COLON:
+        case TOK_RWORD_SELF:
+            if(tok.type() != TOK_RWORD_SELF || lex.lookahead(0) == TOK_DOUBLE_COLON) {
+                PUTBACK(tok, lex);
+                auto p = Parse_Path(lex, PATH_GENERIC_EXPR);
+                if( lex.lookahead(0) == TOK_EXCLAM && lex.lookahead(1) == TOK_BRACE_OPEN ) {
+                    GET_CHECK_TOK(tok, lex, TOK_EXCLAM);
+                    return Parse_ExprMacro(lex, std::move(p));
+                }
+                tok = Token(Token::TagTakeIP(), InterpolatedFragment(std::move(p)));
+            }
+            break;
+        default:
+            break;
+        }
+
         switch( tok.type() )
         {
         case TOK_INTERPOLATED_BLOCK:
@@ -347,7 +388,7 @@ ExprNodeP Parse_WhileStmt(TokenStream& lex, Ident lifetime)
 
     if( GET_TOK(tok, lex) == TOK_RWORD_LET ) {
         // TODO: Pattern list (same as match)?
-        auto pat = Parse_Pattern(lex, true);    // Refutable pattern
+        auto pat = Parse_Pattern(lex, AllowOrPattern::Yes);    // Refutable pattern
         GET_CHECK_TOK(tok, lex, TOK_EQUAL);
         ExprNodeP val;
         {
@@ -373,7 +414,7 @@ ExprNodeP Parse_ForStmt(TokenStream& lex, Ident lifetime)
     Token   tok;
 
     // Irrefutable pattern
-    auto pat = Parse_Pattern(lex, false);
+    auto pat = Parse_Pattern(lex, AllowOrPattern::Yes);
     GET_CHECK_TOK(tok, lex, TOK_RWORD_IN);
     ExprNodeP val;
     {
@@ -401,7 +442,7 @@ ExprNodeP Parse_IfStmt(TokenStream& lex)
                    GET_TOK(tok, lex);
             // Refutable pattern
             do {
-                paterns.push_back( Parse_Pattern(lex, true) );
+                paterns.push_back( Parse_Pattern(lex, AllowOrPattern::No) );
             } while(GET_TOK(tok, lex) == TOK_PIPE);
             CHECK_TOK(tok, TOK_EQUAL);
             cond = Parse_Expr0(lex);
@@ -469,7 +510,7 @@ ExprNodeP Parse_Expr_Match(TokenStream& lex)
             GET_TOK(tok, lex);
         do {
             // Refutable pattern
-            arm.m_patterns.push_back( Parse_Pattern(lex, true) );
+            arm.m_patterns.push_back( Parse_Pattern(lex, AllowOrPattern::No) );
         } while( GET_TOK(tok, lex) == TOK_PIPE );
 
         if( tok.type() == TOK_RWORD_IF )
@@ -573,7 +614,7 @@ ExprNodeP Parse_Stmt(TokenStream& lex)
 ExprNodeP Parse_Stmt_Let(TokenStream& lex)
 {
     Token   tok;
-    AST::Pattern pat = Parse_Pattern(lex, false);   // irrefutable
+    AST::Pattern pat = Parse_Pattern(lex, AllowOrPattern::Yes);   // irrefutable
     TypeRef type { lex.point_span() };
     if( GET_TOK(tok, lex) == TOK_COLON ) {
         type = Parse_Type(lex);
@@ -921,6 +962,23 @@ ExprNodeP Parse_Expr13(TokenStream& lex)
         // HACK: Split && into & &
         lex.putback( Token(TOK_AMP) );
     case TOK_AMP:
+        if( lex.lookahead(0) == TOK_IDENT )
+        {
+            GET_TOK(tok, lex);
+            if(tok.ident() == "raw") {
+                if( lex.lookahead(0) == TOK_RWORD_MUT ) {
+                    GET_TOK(tok, lex);
+                    return NEWNODE( AST::ExprNode_UniOp, AST::ExprNode_UniOp::RawBorrowMut, Parse_Expr12(lex) );
+                }
+                else if( lex.lookahead(0) == TOK_RWORD_CONST ) {
+                    GET_TOK(tok, lex);
+                    return NEWNODE( AST::ExprNode_UniOp, AST::ExprNode_UniOp::RawBorrow, Parse_Expr12(lex) );
+                }
+                else {
+                }
+            }
+            PUTBACK(tok, lex);
+        }
         if( GET_TOK(tok, lex) == TOK_RWORD_MUT )
             return NEWNODE( AST::ExprNode_UniOp, AST::ExprNode_UniOp::REFMUT, Parse_Expr12(lex) );
         else {
@@ -1109,7 +1167,7 @@ ExprNodeP Parse_ExprVal_Closure(TokenStream& lex)
         {
             PUTBACK(tok, lex);
             // Irrefutable pattern
-            AST::Pattern    pat = Parse_Pattern(lex, false);
+            AST::Pattern    pat = Parse_Pattern(lex, AllowOrPattern::No);
 
             TypeRef type { lex.point_span() };
             if( GET_TOK(tok, lex) == TOK_COLON )
@@ -1302,6 +1360,7 @@ ExprNodeP Parse_ExprVal(TokenStream& lex)
         }
         else
         {
+            CLEAR_PARSE_FLAG(lex, disallow_struct_literal);
             PUTBACK(tok, lex);
             auto first = Parse_Expr0(lex);
             if( GET_TOK(tok, lex) == TOK_SEMICOLON )
@@ -1368,6 +1427,7 @@ TokenTree Parse_TT(TokenStream& lex, bool unwrapped)
     TokenTree   rv;
     TRACE_FUNCTION_FR("", rv);
 
+    auto edition = lex.get_edition();
     Token tok = lex.getToken();
     eTokenType  closer = TOK_PAREN_CLOSE;
     switch(tok.type())
@@ -1389,13 +1449,14 @@ TokenTree Parse_TT(TokenStream& lex, bool unwrapped)
     case TOK_BRACE_CLOSE:
         throw ParseError::Unexpected(lex, tok);
     default:
-        rv = TokenTree(lex.get_hygiene(), mv$(tok) );
+        rv = TokenTree(edition, lex.get_hygiene(), mv$(tok) );
+        DEBUG(rv);
         return rv;
     }
 
     ::std::vector<TokenTree>   items;
     if( !unwrapped )
-        items.push_back( TokenTree(lex.get_hygiene(), mv$(tok)) );
+        items.push_back( TokenTree(edition, lex.get_hygiene(), mv$(tok)) );
     while(GET_TOK(tok, lex) != closer && tok.type() != TOK_EOF)
     {
         if( tok.type() == TOK_NULL )
@@ -1404,7 +1465,8 @@ TokenTree Parse_TT(TokenStream& lex, bool unwrapped)
         items.push_back(Parse_TT(lex, false));
     }
     if( !unwrapped )
-        items.push_back( TokenTree(lex.get_hygiene(), mv$(tok)) );
-    rv = TokenTree(lex.get_hygiene(), mv$(items));
+        items.push_back( TokenTree(lex.get_edition(), lex.get_hygiene(), mv$(tok)) );
+    rv = TokenTree(edition, lex.get_hygiene(), mv$(items));
+    DEBUG(rv);
     return rv;
 }

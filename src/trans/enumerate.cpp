@@ -179,7 +179,7 @@ namespace {
             }
             } break;
         TU_ARM(vi, Function, e) {
-            if( e.m_params.m_types.size() == 0 )
+            if( !e.m_params.is_generic() )
             {
                 if( is_visible ) {
                     state.enum_fcn(get_path(), e, {});
@@ -216,7 +216,7 @@ namespace {
         static Span sp;
         const auto& impl_ty = impl.m_type;
         TRACE_FUNCTION_F("Impl " << trait_path << impl.m_trait_args << " for " << impl_ty);
-        if( impl.m_params.m_types.size() == 0 )
+        if( !impl.m_params.is_generic() )
         {
             auto cb_monomorph = MonomorphStatePtr(&impl_ty, &impl.m_trait_args, nullptr);
 
@@ -229,7 +229,7 @@ namespace {
                 if( vi.second.is_Constant() )
                     ;
                 // Generic method, no codegen
-                else if( vi.second.is_Function() && vi.second.as_Function().m_params.m_types.size() > 0 )
+                else if( vi.second.is_Function() && vi.second.as_Function().m_params.is_generic() )
                     ;
                 // VTable, magic
                 else if( vi.first == "vtable#" )
@@ -265,7 +265,7 @@ namespace {
             }
             for(auto& m : impl.m_methods)
             {
-                if( m.second.data.m_params.m_types.size() > 0 )
+                if( m.second.data.m_params.is_generic() )
                     m.second.data.m_save_code = true;
             }
         }
@@ -313,12 +313,12 @@ TransList Trans_Enumerate_Public(::HIR::Crate& crate)
         static void enumerate_type_impl(EnumState& state, ::HIR::TypeImpl& impl)
         {
             TRACE_FUNCTION_F("impl" << impl.m_params.fmt_args() << " " << impl.m_type);
-            if( impl.m_params.m_types.size() == 0 )
+            if( !impl.m_params.is_generic() )
             {
                 for(auto& fcn : impl.m_methods)
                 {
                     DEBUG("fn " << fcn.first << fcn.second.data.m_params.fmt_args());
-                    if( fcn.second.data.m_params.m_types.size() == 0 )
+                    if( !fcn.second.data.m_params.is_generic() )
                     {
                         auto path = ::HIR::Path(impl.m_type.clone(), fcn.first);
                         state.enum_fcn(mv$(path), fcn.second.data, {});
@@ -356,52 +356,10 @@ TransList Trans_Enumerate_Public(::HIR::Crate& crate)
 
     auto rv = Trans_Enumerate_CommonPost(state);
 
-    struct H
-    {
-        static bool is_generic(const ::HIR::TypeRef& ty)
-        {
-            return visit_ty_with(ty, [&](const auto& ty) {
-                return ty.data().is_Generic();
-                });
-        }
-        static bool is_generic(const ::HIR::PathParams& pp)
-        {
-            for(const auto& ty : pp.m_types)
-                if( is_generic(ty) )
-                    return true;
-            return false;
-        }
-        static bool is_generic(const ::HIR::Path& p)
-        {
-            TU_MATCHA( (p.m_data), (pe),
-            (Generic,
-                return is_generic(pe.m_params);
-                ),
-            (UfcsKnown,
-                if( is_generic(pe.type) )
-                    return true;
-                if( is_generic(pe.trait.m_params) )
-                    return true;
-                if( is_generic(pe.params) )
-                    return true;
-                ),
-            (UfcsInherent,
-                if( is_generic(pe.type) )
-                    return true;
-                if( is_generic(pe.params) )
-                    return true;
-                ),
-            (UfcsUnknown,
-                )
-            )
-            return false;
-        }
-    };
-
     // Strip out any functions/types/statics that are still generic?
     for(auto it = rv.m_functions.begin(); it != rv.m_functions.end(); )
     {
-        if( H::is_generic(it->first) ) {
+        if( monomorphise_path_needed(it->first) ) {
             rv.m_functions.erase(it++);
         }
         else {
@@ -410,7 +368,7 @@ TransList Trans_Enumerate_Public(::HIR::Crate& crate)
     }
     for(auto it = rv.m_statics.begin(); it != rv.m_statics.end(); )
     {
-        if( H::is_generic(it->first) ) {
+        if( monomorphise_path_needed(it->first) ) {
             rv.m_statics.erase(it++);
         }
         else {
@@ -784,12 +742,13 @@ namespace
             auto monomorph = [&](const auto& ty)->const auto& {
                 return pp.maybe_monomorph(m_resolve, tmp, ty);
                 };
+            bool has_erased = visit_ty_with(fcn.m_return, [&](const auto& x) { return x.data().is_ErasedType(); });
             // Handle erased types in the return type.
-            if( visit_ty_with(fcn.m_return, [](const auto& x) { return x.data().is_ErasedType()||x.data().is_Generic(); }) )
+            if( has_erased || monomorphise_type_needed(fcn.m_return) )
             {
                 // If there's an erased type, make a copy with the erased type expanded
                 ::HIR::TypeRef  ret_ty;
-                if( visit_ty_with(fcn.m_return, [&](const auto& x) { return x.data().is_ErasedType(); }) )
+                if( has_erased )
                 {
                     ret_ty = clone_ty_with(sp, fcn.m_return, [&](const auto& x, auto& out) {
                         if( const auto* te = x.data().opt_ErasedType() ) {
@@ -917,6 +876,17 @@ namespace
                         mir_visit.visit_stmt(stmt);
                     }
                     mir_visit.visit_terminator(block.terminator);
+
+                    // HACK: Currently calling `caller_location` creates an empty location (so needs the type)
+                    if( block.terminator.is_Call() && block.terminator.as_Call().fcn.is_Intrinsic() ) {
+                        const auto& e2 = block.terminator.as_Call().fcn.as_Intrinsic();
+                        if( e2.name == "caller_location" ) {
+                            const auto& p = mir_res.m_resolve.m_crate.get_lang_item_path(sp, "panic_location");
+                            const auto& s = mir_res.m_resolve.m_crate.get_struct_by_path(sp, p);
+                            tv.visit_type(HIR::TypeRef::new_path(p, &s));
+                        }
+
+                    }
                 }
             }
         }
@@ -953,6 +923,16 @@ void Trans_Enumerate_Types(EnumState& state)
         for(const auto& ent : state.rv.m_statics)
         {
             TRACE_FUNCTION_F("Enumerate static " << ent.first);
+            assert(ent.second->ptr);
+            const auto& stat = *ent.second->ptr;
+            const auto& pp = ent.second->pp;
+
+            tv.visit_type( pp.monomorph(tv.m_resolve, stat.m_type) );
+        }
+        // - Constants need visiting, as they will be expanded
+        for(const auto& ent : state.rv.m_constants)
+        {
+            TRACE_FUNCTION_F("Enumerate constant " << ent.first);
             assert(ent.second->ptr);
             const auto& stat = *ent.second->ptr;
             const auto& pp = ent.second->pp;
@@ -1032,7 +1012,8 @@ void Trans_Enumerate_Types(EnumState& state)
                 // Reqire drop glue for inner type.
                 // - Should that already exist?
                 // Requires box_free lang item
-                Trans_Enumerate_FillFrom_PathMono(state, ::HIR::GenericPath( state.crate.get_lang_item_path(sp, "box_free"), { ity->clone() } ));
+                const auto& p = ty.data().as_Path().path.m_data.as_Generic().m_params;
+                Trans_Enumerate_FillFrom_PathMono(state, ::HIR::GenericPath( state.crate.get_lang_item_path(sp, "box_free"), p.clone() ));
             }
         }
         types_count = state.rv.m_types.size();
@@ -1050,15 +1031,18 @@ namespace {
         (Static, const ::HIR::Static*),
         (Constant, const ::HIR::Constant*)
         );
-    EntPtr get_ent_fullpath(const Span& sp, const ::HIR::Crate& crate, const ::HIR::Path& path, ::HIR::PathParams& impl_pp)
+    EntPtr get_ent_fullpath(const Span& sp, const ::HIR::Crate& crate, const ::HIR::Path& path, ::HIR::PathParams& impl_pp, const ::HIR::GenericParams*& impl_def)
     {
         TRACE_FUNCTION_F(path);
         StaticTraitResolve  resolve { crate };
 
         MonomorphState  ms;
-        auto ent = resolve.get_value(sp, path, ms, /*signature_only=*/false);
+        impl_def = nullptr;
+        auto ent = resolve.get_value(sp, path, ms, /*signature_only=*/false, &impl_def);
         if(ms.get_impl_params()) {
             impl_pp = ms.get_impl_params()->clone();
+            if(impl_pp.has_params())
+                assert(impl_def);
         }
         DEBUG(path << " = " << ent.tag_str() << " w/ impl" << impl_pp);
         TU_MATCH_HDRA( (ent), {)
@@ -1174,7 +1158,9 @@ void Trans_Enumerate_FillFrom_PathMono(EnumState& state, ::HIR::Path path_mono)
     }
     // Get the item type
     // - Valid types are Function and Static
-    auto item_ref = get_ent_fullpath(sp, state.crate, path_mono, sub_pp.pp_impl);
+    auto item_ref = get_ent_fullpath(sp, state.crate, path_mono, sub_pp.pp_impl, sub_pp.gdef_impl);
+    DEBUG("sub_pp.pp_method = " << sub_pp.pp_method);
+    DEBUG("sub_pp.pp_impl = " << sub_pp.pp_impl);
     TU_MATCH_HDRA( (item_ref), {)
     TU_ARMA(NotFound, e) {
         BUG(sp, "Item not found for " << path_mono);
@@ -1317,7 +1303,8 @@ void Trans_Enumerate_FillFrom_MIR_Constant(MIR::EnumCache& state, const ::MIR::C
     (Generic,
         ),
     (ItemAddr,
-        state.insert_path(*ce);
+        if(ce)
+            state.insert_path(*ce);
         )
     )
 }
@@ -1336,8 +1323,8 @@ void Trans_Enumerate_FillFrom_MIR(MIR::EnumCache& state, const ::MIR::Function& 
     {
         for(const auto& stmt : bb.statements)
         {
-            TU_MATCHA((stmt), (se),
-            (Assign,
+            TU_MATCH_HDRA((stmt), {)
+            TU_ARMA(Assign, se) {
                 DEBUG("- " << se.dst << " = " << se.src);
                 Trans_Enumerate_FillFrom_MIR_LValue(state, se.dst);
                 TU_MATCHA( (se.src), (e),
@@ -1393,24 +1380,39 @@ void Trans_Enumerate_FillFrom_MIR(MIR::EnumCache& state, const ::MIR::Function& 
                         Trans_Enumerate_FillFrom_MIR_Param(state, val);
                     )
                 )
-                ),
-            (Asm,
-                DEBUG("- asm! ...");
+                }
+            TU_ARMA(Asm2, e) {
+                for(auto& p : e.params)
+                {
+                    TU_MATCH_HDRA( (p), { )
+                    TU_ARMA(Const, v) Trans_Enumerate_FillFrom_MIR_Constant(state, v);
+                    TU_ARMA(Sym, v) state.insert_path(v);
+                    TU_ARMA(Reg, v) {
+                        if(v.input)
+                            Trans_Enumerate_FillFrom_MIR_Param(state, *v.input);
+                        if(v.output)
+                            Trans_Enumerate_FillFrom_MIR_LValue(state, *v.output);
+                        }
+                    }
+                }
+                }
+            TU_ARMA(Asm, se) {
+                DEBUG("- llvm_asm! ...");
                 for(const auto& v : se.inputs)
                     Trans_Enumerate_FillFrom_MIR_LValue(state, v.second);
                 for(const auto& v : se.outputs)
                     Trans_Enumerate_FillFrom_MIR_LValue(state, v.second);
-                ),
-            (SetDropFlag,
-                ),
-            (ScopeEnd,
-                ),
-            (Drop,
+                }
+            TU_ARMA(SetDropFlag, se) {
+                }
+            TU_ARMA(ScopeEnd, se) {
+                }
+            TU_ARMA(Drop, se) {
                 DEBUG("- DROP " << se.slot);
                 Trans_Enumerate_FillFrom_MIR_LValue(state, se.slot);
                 // TODO: Ensure that the drop glue for this type is generated
-                )
-            )
+                }
+            }
         }
         DEBUG("> " << bb.terminator);
         TU_MATCHA( (bb.terminator), (e),

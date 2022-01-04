@@ -50,6 +50,8 @@ CXXFLAGS += -Wno-misleading-indentation
 #CXXFLAGS += -Wno-unused-private-field
 CXXFLAGS += -Wno-unknown-warning-option
 
+CXXFLAGS += -Werror=return-type
+
 
 # - Flags to pass to all mrustc invocations
 RUST_FLAGS := --cfg debug_assertions
@@ -103,6 +105,7 @@ OBJ +=  expand/rustc_diagnostics.o
 OBJ +=  expand/proc_macro.o
 OBJ +=  expand/assert.o expand/compile_error.o
 OBJ +=  expand/codegen.o expand/doc.o expand/lints.o expand/misc_attrs.o expand/stability.o
+OBJ +=  expand/panic.o
 OBJ += expand/test_harness.o
 OBJ += macro_rules/mod.o macro_rules/eval.o macro_rules/parse.o
 OBJ += resolve/use.o resolve/index.o resolve/absolute.o resolve/common.o
@@ -112,8 +115,10 @@ OBJ +=  hir/hir.o hir/hir_ops.o hir/generic_params.o
 OBJ +=  hir/crate_ptr.o hir/expr_ptr.o
 OBJ +=  hir/type.o hir/path.o hir/expr.o hir/pattern.o
 OBJ +=  hir/visitor.o hir/crate_post_load.o
+OBJ +=  hir/inherent_cache.o
 OBJ += hir_conv/expand_type.o hir_conv/constant_evaluation.o hir_conv/resolve_ufcs.o hir_conv/bind.o hir_conv/markings.o
 OBJ += hir_typeck/outer.o hir_typeck/common.o hir_typeck/helpers.o hir_typeck/static.o hir_typeck/impl_ref.o
+OBJ += hir_typeck/resolve_common.o
 OBJ += hir_typeck/expr_visit.o
 OBJ += hir_typeck/expr_cs.o hir_typeck/expr_cs__enum.o
 OBJ += hir_typeck/expr_check.o
@@ -140,7 +145,7 @@ OBJ := $(addprefix $(OBJDIR),$(OBJ))
 all: $(BIN)
 
 clean:
-	$(RM) -r $(BIN) $(OBJ)
+	$(RM) -r $(BIN) $(OBJ) bin/mrustc.a
 
 
 PIPECMD ?= 2>&1 | tee $@_dbg.txt | tail -n $(TAIL_COUNT) ; test $${PIPESTATUS[0]} -eq 0
@@ -169,7 +174,7 @@ output$(OUTDIR_SUF)/libtest.rlib output$(OUTDIR_SUF)/libpanic_unwind.rlib output
 output$(OUTDIR_SUF)/rustc output$(OUTDIR_SUF)/cargo: output$(OUTDIR_SUF)/libtest.rlib
 	$(MAKE_MINICARGO) $@
 
-TEST_DEPS := output$(OUTDIR_SUF)/libstd.rlib output$(OUTDIR_SUF)/libtest.rlib output$(OUTDIR_SUF)/libpanic_unwind.rlib
+TEST_DEPS := output$(OUTDIR_SUF)/libstd.rlib output$(OUTDIR_SUF)/libtest.rlib output$(OUTDIR_SUF)/libpanic_unwind.rlib output$(OUTDIR_SUF)/libproc_macro.rlib
 
 fcn_extcrate = $(patsubst %,output$(OUTDIR_SUF)/lib%.rlib,$(1))
 
@@ -266,9 +271,11 @@ rust_tests-libs: $(TEST_DEPS)
 #
 test: output$(OUTDIR_SUF)/rust/test_run-pass_hello_out.txt
 
-HELLO_TEST := run-pass/hello.rs
-ifeq ($(RUSTC_VERSION),1.39.0)
-  HELLO_TEST := ui/hello.rs
+HELLO_TEST := ui/hello.rs
+ifeq ($(RUSTC_VERSION),1.19.0)
+  HELLO_TEST := run-pass/hello.rs
+else ifeq ($(RUSTC_VERSION),1.29.0)
+  HELLO_TEST := run-pass/hello.rs
 endif
 
 # "hello, world" test - Invoked by the `make test` target
@@ -285,27 +292,36 @@ output$(OUTDIR_SUF)/rust/test_run-pass_hello_out.txt: output$(OUTDIR_SUF)/rust/t
 # Compile rules for mrustc itself
 # -------------------------------
 bin/mrustc.a: $(filter-out $(OBJDIR)main.o, $(OBJ))
-	@mkdir -p $(dir $@)
+	@+mkdir -p $(dir $@)
 	@echo [AR] -o $@
-	$Var rcD $@ $(filter-out $(OBJDIR)main.o, $(OBJ))
-$(BIN): $(OBJDIR)main.o bin/mrustc.a bin/common_lib.a
-	@mkdir -p $(dir $@)
-	@echo [CXX] -o $@
-	$V$(CXX) -o $@ $(LINKFLAGS) $(OBJDIR)main.o -Wl,--whole-archive bin/mrustc.a -Wl,--no-whole-archive bin/common_lib.a $(LIBS)
-ifeq ($(OS),Windows_NT)
-else ifeq ($(shell uname -s || echo not),Darwin)
+ifeq ($(shell uname -s || echo not),Darwin)
+# We can use llvm-ar for having rcD available on Darwin.
+# However, that is not bundled as a part of the operating system.
+	$Var rc $@ $(filter-out $(OBJDIR)main.o, $(OBJ))
 else
+	$Var rcD $@ $(filter-out $(OBJDIR)main.o, $(OBJ))
+endif
+
+$(BIN): $(OBJDIR)main.o bin/mrustc.a bin/common_lib.a
+	@+mkdir -p $(dir $@)
+	@echo [CXX] -o $@
+ifeq ($(OS),Windows_NT)
+	$V$(CXX) -o $@ $(LINKFLAGS) $(OBJDIR)main.o -Wl,--whole-archive bin/mrustc.a bin/common_lib.a -Wl,--no-whole-archive $(LIBS)
+else ifeq ($(shell uname -s || echo not),Darwin)
+	$V$(CXX) -o $@ $(LINKFLAGS) $(OBJDIR)main.o -Wl,-all_load bin/mrustc.a bin/common_lib.a $(LIBS)
+else
+	$V$(CXX) -o $@ $(LINKFLAGS) $(OBJDIR)main.o -Wl,--whole-archive bin/mrustc.a -Wl,--no-whole-archive bin/common_lib.a $(LIBS)
 	objcopy --only-keep-debug $(BIN) $(BIN).debug
 	objcopy --add-gnu-debuglink=$(BIN).debug $(BIN)
 	strip $(BIN)
 endif
 
 $(OBJDIR)%.o: src/%.cpp
-	@mkdir -p $(dir $@)
+	@+mkdir -p $(dir $@)
 	@echo [CXX] -o $@
 	$V$(CXX) -o $@ -c $< $(CXXFLAGS) $(CPPFLAGS) -MMD -MP -MF $@.dep
 $(OBJDIR)version.o: $(OBJDIR)%.o: src/%.cpp $(filter-out $(OBJDIR)version.o,$(OBJ)) Makefile
-	@mkdir -p $(dir $@)
+	@+mkdir -p $(dir $@)
 	@echo [CXX] -o $@
 	$V$(CXX) -o $@ -c $< $(CXXFLAGS) $(CPPFLAGS) -MMD -MP -MF $@.dep -D VERSION_GIT_FULLHASH=\"$(shell git show --pretty=%H -s)\" -D VERSION_GIT_BRANCH="\"$(shell git symbolic-ref -q --short HEAD || git describe --tags --exact-match)\"" -D VERSION_GIT_SHORTHASH=\"$(shell git show -s --pretty=%h)\" -D VERSION_BUILDTIME="\"$(shell date -uR)\"" -D VERSION_GIT_ISDIRTY=$(shell git diff-index --quiet HEAD; echo $$?)
 

@@ -11,6 +11,7 @@
 #include <string>
 #include <memory>   // std::unique_ptr
 #include <hir/type.hpp>
+#include "../hir/asm.hpp"
 
 struct MonomorphState;
 
@@ -515,9 +516,9 @@ TAGGED_UNION_EX(RValue, (), Tuple, (
     (Constant, Constant),
     (SizedArray, struct {
         Param   val;
-        unsigned int    count;
+        ::HIR::ArraySize    count;
         }),
-    // Cast on primitives
+    // Cast on primitives (thin pointers, integers, floats)
     (Cast, struct {
         LValue  val;
         ::HIR::TypeRef  type;
@@ -543,6 +544,7 @@ TAGGED_UNION_EX(RValue, (), Tuple, (
         LValue  val;
         }),
     // Construct a DST pointer from a thin pointer and metadata
+    // OR: (if `meta_val` is `Constant::ItemAddr(nullptr)`) A still-to-be-resolved unsizing coercion
     (MakeDst, struct {
         Param   ptr_val;
         Param   meta_val;
@@ -593,9 +595,12 @@ TAGGED_UNION(CallTarget, Intrinsic,
 TAGGED_UNION_EX(SwitchValues, (), Unsigned, (
     (Unsigned, ::std::vector<uint64_t>),
     (Signed, ::std::vector<int64_t>),
-    (String, ::std::vector<::std::string>)
+    (String, ::std::vector<::std::string>),
+    (ByteString, ::std::vector<::std::vector<uint8_t>>)
     ), (),(), (
         SwitchValues clone() const;
+        bool operator==(const SwitchValues& x) const;
+        bool operator!=(const SwitchValues& x) const { return !(*this == x); }
     )
     );
 
@@ -634,6 +639,18 @@ static inline bool operator!=(const Terminator& a, const Terminator& b) {
     return !(a == b);
 }
 
+TAGGED_UNION(AsmParam, Const,
+    (Const, ::MIR::Constant),
+    (Sym, ::HIR::Path),
+    (Reg, struct {
+        AsmCommon::Direction    dir;
+        AsmCommon::RegisterSpec spec;
+        std::unique_ptr<MIR::Param> input;
+        std::unique_ptr<MIR::LValue> output;
+        })
+    );
+extern bool operator==(const AsmParam& a, const AsmParam& b);
+
 enum class eDropKind {
     SHALLOW,
     DEEP,
@@ -644,13 +661,19 @@ TAGGED_UNION(Statement, Asm,
         LValue  dst;
         RValue  src;
         }),
-    // Inline assembly
+    // Inline assembly (`llvm_asm!`)
     (Asm, struct {
         ::std::string   tpl;
         ::std::vector< ::std::pair<::std::string,LValue> >  outputs;
         ::std::vector< ::std::pair<::std::string,LValue> >  inputs;
         ::std::vector< ::std::string>   clobbers;
         ::std::vector< ::std::string>   flags;
+        }),
+    // Inline assembly (stabilised)
+    (Asm2, struct {
+        AsmCommon::Options  options;
+        std::vector<AsmCommon::Line>   lines;
+        ::std::vector<AsmParam> params;
         }),
     // Update the state of a drop flag
     (SetDropFlag, struct {

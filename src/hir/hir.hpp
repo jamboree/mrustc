@@ -26,100 +26,11 @@
 #include <hir/expr_ptr.hpp>
 #include <hir/generic_params.hpp>
 #include <hir/crate_ptr.hpp>
+#include <hir/encoded_literal.hpp>
+#include <hir/inherent_cache.hpp>
 
 #define ABI_RUST    "Rust"
 #define CRATE_BUILTINS  "#builtins" // used for macro re-exports of builtins
-
-
-struct Reloc {
-    size_t  ofs;
-    size_t  len;
-    ::std::unique_ptr<::HIR::Path>  p;
-    ::std::string   bytes;
-
-    static Reloc new_named(size_t ofs, size_t len, ::HIR::Path p) {
-        return Reloc { ofs, len, box$(p), "" };
-    }
-    static Reloc new_bytes(size_t ofs, size_t len, ::std::string bytes) {
-        return Reloc { ofs, len, nullptr, ::std::move(bytes) };
-    }
-
-    friend ::std::ostream& operator<<(::std::ostream& os, const Reloc& x) {
-        os << "@" << std::hex << "0x" << x.ofs << std::dec << "+" << x.len << " = ";
-        if(x.p) {
-            os << "&" << *x.p;
-        }
-        else {
-            os << "\"" << FmtEscaped(x.bytes) << "\"";
-        }
-        return os;
-    }
-};
-struct EncodedLiteral {
-    static const unsigned PTR_BASE = 0x1000;
-
-    std::vector<uint8_t>    bytes;
-    std::vector<Reloc>  relocations;
-
-    EncodedLiteral clone() const;
-
-    void write_uint(size_t ofs, size_t size,  uint64_t v);
-
-    friend ::std::ostream& operator<<(std::ostream& os, const EncodedLiteral& x) {
-        for(size_t i = 0; i < x.bytes.size(); i++)
-        {
-            const char* HEX = "0123456789ABCDEF";
-            os << HEX[x.bytes[i]>>4] << HEX[x.bytes[i]&0xF];
-            if( (i+1)%8 == 0 && i + 1 < x.bytes.size() ) {
-                os << " ";
-            }
-        }
-        os << "{" << x.relocations << "}";
-        return os;
-    }
-};
-
-struct EncodedLiteralSlice
-{
-    const EncodedLiteral& m_base;
-    size_t  m_ofs;
-    size_t  m_size;
-    //size_t  m_reloc_ofs;
-    //size_t  m_reloc_size;
-
-    EncodedLiteralSlice(const EncodedLiteral& base)
-        : m_base(base)
-        , m_ofs(0)
-        , m_size(base.bytes.size())
-        //, m_reloc_ofs(0)
-        //, m_reloc_size(base.relocations.size())
-    {
-    }
-
-    EncodedLiteralSlice slice(size_t ofs) const {
-        assert(ofs <= m_size);
-        return slice(ofs, m_size - ofs);
-    }
-    EncodedLiteralSlice slice(size_t ofs, size_t len) const {
-        assert(ofs <= m_size);
-        assert(len <= m_size);
-        assert(ofs+len <= m_size);
-        auto rv = EncodedLiteralSlice(m_base);
-        rv.m_ofs = m_ofs + ofs;
-        rv.m_size = len;
-        return rv;
-    }
-
-    uint64_t read_uint(size_t size=0) const;
-     int64_t read_sint(size_t size=0) const;
-    double read_float(size_t size=0) const;
-    const Reloc* get_reloc() const;
-
-    bool operator==(const EncodedLiteralSlice& x) const;
-    bool operator!=(const EncodedLiteralSlice& x) const { return !(*this == x); }
-
-    friend ::std::ostream& operator<<(std::ostream& os, const EncodedLiteralSlice& x);
-};
 
 namespace HIR {
 
@@ -195,6 +106,8 @@ struct Linkage
 
     // External symbol name
     ::std::string   name;
+    // Target section
+    ::std::string   section;
 };
 
 class Static
@@ -264,21 +177,40 @@ public:
 
     typedef ::std::vector< ::std::pair< ::HIR::Pattern, ::HIR::TypeRef> >   args_t;
 
-    bool    m_save_code;    // Filled by enumerate, defaults to false
+    bool    m_save_code = false;    // Filled by enumerate, defaults to false
     Linkage m_linkage;
 
-    Receiver    m_receiver;
-    ::std::string   m_abi;
-    bool    m_unsafe;
-    bool    m_const;
+    Receiver    m_receiver = Receiver::Free;
+    HIR::TypeRef    m_receiver_type;    // Receiver type for when a custom
+    ::std::string   m_abi = ABI_RUST;
+    bool    m_unsafe = false;
+    bool    m_const = false;
 
     GenericParams   m_params;
 
     args_t  m_args;
-    bool    m_variadic;
+    bool    m_variadic = false;
     TypeRef m_return;
 
     ExprPtr m_code;
+
+    struct Markings {
+        std::vector<unsigned> rustc_legacy_const_generics;
+        bool track_caller = false;
+    } m_markings;
+
+    Function()
+    {
+    }
+    Function(Receiver receiver, GenericParams params, args_t args, TypeRef ret_ty, ExprPtr code)
+        : m_receiver(receiver)
+        , m_params(std::move(params))
+        , m_args(std::move(args))
+        , m_variadic(false)
+        , m_return(std::move(ret_ty))
+        , m_code(std::move(code))
+    {
+    }
 
     //::HIR::TypeRef make_ty(const Span& sp, const ::HIR::PathParams& params) const;
 };
@@ -290,6 +222,11 @@ struct TypeAlias
 {
     GenericParams   m_params;
     ::HIR::TypeRef  m_type;
+};
+struct TraitAlias
+{
+    GenericParams   m_params;
+    ::std::vector< ::HIR::TraitPath>    m_traits;
 };
 
 typedef ::std::vector< VisEnt<::HIR::TypeRef> > t_tuple_fields;
@@ -418,9 +355,7 @@ public:
     {
         Rust,
         C,
-        Packed,
         Simd,
-        Aligned,    // Alignment stored elsewhere
         Transparent,
     };
     TAGGED_UNION(Data, Unit,
@@ -449,6 +384,7 @@ public:
     Repr    m_repr;
     Data    m_data;
     unsigned    m_forced_alignment = 0;
+    unsigned    m_max_field_alignment = 0;    // for packed
 
     TraitMarkings   m_markings;
     StructMarkings  m_struct_markings;
@@ -490,6 +426,7 @@ class Trait
 public:
     GenericParams   m_params;
     LifetimeRef m_lifetime;
+    // NOTE: Not serialised!
     ::std::vector< ::HIR::TraitPath >  m_parent_traits;
 
     bool    m_is_marker;    // aka OIBIT
@@ -558,6 +495,7 @@ TAGGED_UNION(TypeItem, Import,
     (Import, struct { ::HIR::SimplePath path; bool is_variant; unsigned int idx; }),
     (Module, Module),
     (TypeAlias, TypeAlias), // NOTE: These don't introduce new values
+    (TraitAlias, TraitAlias),
     (ExternType, ExternType),
     (Enum,      Enum),
     (Struct,    Struct),
@@ -714,11 +652,14 @@ public:
     // - Unsorted (generics, and everything before outer type resolution)
     ImplGroup<::std::unique_ptr<::HIR::TypeImpl>>  m_type_impls;
 
+    /// CACHE: Cache of all inherent (non-trait) methods (for faster lookup)
+    InherentCache   m_inherent_method_cache;
+
     /// Impl blocks
     ::std::map< ::HIR::SimplePath, ImplGroup<::std::unique_ptr<::HIR::TraitImpl>> > m_trait_impls;
     ::std::map< ::HIR::SimplePath, ImplGroup<::std::unique_ptr<::HIR::MarkerImpl>> > m_marker_impls;
 
-    // TODO: Merged index versions of the above
+    /// Merged index versions of the above
     ImplGroup<const ::HIR::TypeImpl*>   m_all_type_impls;
     ::std::map< ::HIR::SimplePath, ImplGroup<const ::HIR::TraitImpl*> > m_all_trait_impls;
     ::std::map< ::HIR::SimplePath, ImplGroup<const ::HIR::MarkerImpl*> > m_all_marker_impls;
@@ -729,6 +670,9 @@ public:
     /// Language items avaliable through this crate (includes ones from loaded externs)
     ::std::unordered_map< ::std::string, ::HIR::SimplePath> m_lang_items;
 
+    /// Referenced crates (in load order) - Used to ensure final linking order is sane
+    // NOT SERIALISED
+    ::std::vector<RcString> m_ext_crates_ordered;
     /// Referenced crates
     ::std::unordered_map< RcString, ExternCrate>  m_ext_crates;
     /// Referenced system libraries

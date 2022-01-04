@@ -125,6 +125,7 @@
       <AdditionalDependencies>common_lib.lib;mrustc_lib.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
       <AdditionalOptions>/WHOLEARCHIVE:mrustc_lib.lib %(AdditionalOptions)</AdditionalOptions>
+      <Profile>true</Profile>
     </Link>
     <ProjectReference />
     <ProjectReference>
@@ -172,6 +173,7 @@
       <AdditionalDependencies>common_lib.lib;mrustc_lib.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
       <AdditionalOptions>/WHOLEARCHIVE:mrustc_lib.lib %(AdditionalOptions)</AdditionalOptions>
+      <Profile>true</Profile>
     </Link>
     <ProjectReference />
     <ProjectReference>

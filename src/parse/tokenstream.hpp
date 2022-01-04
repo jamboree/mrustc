@@ -24,11 +24,8 @@ namespace AST {
 /// State the parser needs to pass down via a second channel.
 struct ParseState
 {
-private:
-    AST::Edition edition;
 public:
-    ParseState(AST::Edition e):
-        edition(e)
+    ParseState()
     {
     }
 
@@ -46,10 +43,6 @@ public:
         return *this->module;
     }
 
-    AST::Edition get_edition() const { return edition; }
-    bool edition_after(AST::Edition e) { return edition >= e; }
-    bool edition_before(AST::Edition e) { return edition < e; }
-
     friend ::std::ostream& operator<<(::std::ostream& os, const ParseState& ps) {
         os << "ParseState {";
         if(ps.disallow_struct_literal)  os << " disallow_struct_literal";
@@ -66,12 +59,30 @@ class TokenStream
     bool    m_cache_valid;
     Token   m_cache;
     Ident::Hygiene  m_hygiene;
-    ::std::vector< ::std::pair<Token, Ident::Hygiene> > m_lookahead;
+    AST::Edition    m_edition;
+    struct LookaheadEnt {
+        Token   tok;
+        AST::Edition    edition;
+        Ident::Hygiene  hygiene;
+    };
+    ::std::vector< LookaheadEnt > m_lookahead;
     ParseState  m_parse_state;
 public:
     TokenStream(ParseState ps);
     virtual ~TokenStream();
     Token   getToken();
+    /// <summary>Consumes a token if it is of the specified type</summary>
+    bool   getTokenIf(eTokenType exp) { // I'd like std::optional, but not available
+        if(lookahead(0) == exp) {
+            getToken();
+            return true;
+        }
+        else {
+            return false;
+        }
+    }
+    /// <summary>Obtains a token, asserting that it's of the specified type</summary>
+    Token   getTokenCheck(eTokenType exp);
     void    putback(Token tok);
     eTokenType  lookahead(unsigned int count);
 
@@ -80,6 +91,10 @@ public:
     virtual void pop_hygine() {}
 
     ParseState& parse_state() { return m_parse_state; }
+
+    AST::Edition get_edition() const { return m_edition; }
+    bool edition_after(AST::Edition e) const { return m_edition >= e; }
+    bool edition_before(AST::Edition e) const { return m_edition < e; }
 
     ProtoSpan   start_span() const;
     Span    end_span(ProtoSpan ps) const;
@@ -93,6 +108,7 @@ protected:
     virtual Position getPosition() const = 0;
     virtual Span    outerSpan() const { return Span(); }
     virtual Token   realGetToken() = 0;
+    virtual AST::Edition realGetEdition() const = 0;
     virtual Ident::Hygiene realGetHygiene() const = 0;
 private:
     Token innerGetToken();

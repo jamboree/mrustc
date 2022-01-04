@@ -14,240 +14,12 @@
 #include <iomanip>
 #include "debug.hpp"
 #include "miri.hpp"
+#include <target_version.hpp>
+#include "primitive_value.h"
 #undef DEBUG
 
 unsigned ThreadState::s_next_tls_key = 1;
 
-class PrimitiveValue
-{
-public:
-    virtual ~PrimitiveValue() {}
-
-    virtual bool is_zero() const = 0;
-    virtual bool add(const PrimitiveValue& v) = 0;
-    virtual bool subtract(const PrimitiveValue& v) = 0;
-    virtual bool multiply(const PrimitiveValue& v) = 0;
-    virtual bool divide(const PrimitiveValue& v) = 0;
-    virtual bool modulo(const PrimitiveValue& v) = 0;
-    virtual void write_to_value(ValueCommonWrite& tgt, size_t ofs) const = 0;
-
-    virtual U128 as_u128() const = 0;
-
-    template<typename T>
-    const T& check(const char* opname) const
-    {
-        const auto* xp = dynamic_cast<const T*>(this);
-        LOG_ASSERT(xp, "Attempting to " << opname << " mismatched types, expected " << typeid(T).name() << " got " << typeid(*this).name());
-        return *xp;
-    }
-};
-template<typename T>
-struct PrimitiveUInt:
-    public PrimitiveValue
-{
-    typedef PrimitiveUInt<T>    Self;
-    T   v;
-
-    PrimitiveUInt(T v): v(v) {}
-    ~PrimitiveUInt() override {}
-
-    virtual bool is_zero() const {
-        return this->v == 0;
-    }
-    bool add(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("add");
-        T newv = this->v + xp->v;
-        bool did_overflow = newv < this->v;
-        this->v = newv;
-        return !did_overflow;
-    }
-    bool subtract(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("subtract");
-        T newv = this->v - xp->v;
-        bool did_overflow = newv > this->v;
-        this->v = newv;
-        return !did_overflow;
-    }
-    bool multiply(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("multiply");
-        T newv = this->v * xp->v;
-        bool did_overflow = newv < this->v && newv < xp->v;
-        this->v = newv;
-        return !did_overflow;
-    }
-    bool divide(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("divide");
-        if(xp->v == 0)  return false;
-        T newv = this->v / xp->v;
-        this->v = newv;
-        return true;
-    }
-    bool modulo(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("modulo");
-        if(xp->v == 0)  return false;
-        T newv = this->v % xp->v;
-        this->v = newv;
-        return true;
-    }
-
-    U128 as_u128() const override {
-        return U128(static_cast<uint64_t>(this->v));
-    }
-};
-struct PrimitiveU64: public PrimitiveUInt<uint64_t>
-{
-    PrimitiveU64(uint64_t v): PrimitiveUInt(v) {}
-    void write_to_value(ValueCommonWrite& tgt, size_t ofs) const override {
-        tgt.write_u64(ofs, this->v);
-    }
-};
-struct PrimitiveU32: public PrimitiveUInt<uint32_t>
-{
-    PrimitiveU32(uint32_t v): PrimitiveUInt(v) {}
-    void write_to_value(ValueCommonWrite& tgt, size_t ofs) const override {
-        tgt.write_u32(ofs, this->v);
-    }
-};
-struct PrimitiveU16: public PrimitiveUInt<uint16_t>
-{
-    PrimitiveU16(uint16_t v): PrimitiveUInt(v) {}
-    void write_to_value(ValueCommonWrite& tgt, size_t ofs) const override {
-        tgt.write_u16(ofs, this->v);
-    }
-};
-struct PrimitiveU8: public PrimitiveUInt<uint8_t>
-{
-    PrimitiveU8(uint8_t v): PrimitiveUInt(v) {}
-    void write_to_value(ValueCommonWrite& tgt, size_t ofs) const override {
-        tgt.write_u8(ofs, this->v);
-    }
-};
-template<typename T>
-struct PrimitiveSInt:
-    public PrimitiveValue
-{
-    typedef PrimitiveSInt<T>    Self;
-    T   v;
-
-    PrimitiveSInt(T v): v(v) {}
-    ~PrimitiveSInt() override {}
-
-    virtual bool is_zero() const {
-        return this->v == 0;
-    }
-    // TODO: Make this correct.
-    bool add(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("add");
-        T newv = this->v + xp->v;
-        bool did_overflow = newv < this->v;
-        this->v = newv;
-        return !did_overflow;
-    }
-    bool subtract(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("subtract");
-        T newv = this->v - xp->v;
-        bool did_overflow = newv > this->v;
-        this->v = newv;
-        return !did_overflow;
-    }
-    bool multiply(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("multiply");
-        T newv = this->v * xp->v;
-        bool did_overflow = newv < this->v && newv < xp->v;
-        this->v = newv;
-        return !did_overflow;
-    }
-    bool divide(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("divide");
-        if(xp->v == 0)  return false;
-        T newv = this->v / xp->v;
-        this->v = newv;
-        return true;
-    }
-    bool modulo(const PrimitiveValue& x) override {
-        const auto* xp = &x.check<Self>("modulo");
-        if(xp->v == 0)  return false;
-        T newv = this->v % xp->v;
-        this->v = newv;
-        return true;
-    }
-
-    U128 as_u128() const override {
-        return U128(static_cast<uint64_t>(this->v));
-    }
-};
-struct PrimitiveI64: public PrimitiveSInt<int64_t>
-{
-    PrimitiveI64(int64_t v): PrimitiveSInt(v) {}
-    void write_to_value(ValueCommonWrite& tgt, size_t ofs) const override {
-        tgt.write_i64(ofs, this->v);
-    }
-};
-struct PrimitiveI32: public PrimitiveSInt<int32_t>
-{
-    PrimitiveI32(int32_t v): PrimitiveSInt(v) {}
-    void write_to_value(ValueCommonWrite& tgt, size_t ofs) const override {
-        tgt.write_i32(ofs, this->v);
-    }
-};
-
-class PrimitiveValueVirt
-{
-    union {
-        uint64_t    u64[3]; // Allows i128 plus a vtable pointer
-        uint8_t     u8[3*8];
-    } buf;
-    PrimitiveValueVirt() {}
-public:
-    // HACK: No copy/move constructors, assumes that contained data is always POD
-    ~PrimitiveValueVirt() {
-        reinterpret_cast<PrimitiveValue*>(&this->buf)->~PrimitiveValue();
-    }
-    PrimitiveValue& get() { return *reinterpret_cast<PrimitiveValue*>(&this->buf.u8); }
-    const PrimitiveValue& get() const { return *reinterpret_cast<const PrimitiveValue*>(&this->buf.u8); }
-
-    static PrimitiveValueVirt from_value(const ::HIR::TypeRef& t, const ValueRef& v) {
-        PrimitiveValueVirt  rv;
-        LOG_ASSERT(t.get_wrapper() == nullptr, "PrimitiveValueVirt::from_value: " << t);
-        switch(t.inner_type)
-        {
-        case RawType::U8:
-            new(&rv.buf) PrimitiveU8(v.read_u8(0));
-            break;
-        case RawType::U16:
-            new(&rv.buf) PrimitiveU16(v.read_u16(0));
-            break;
-        case RawType::U32:
-            new(&rv.buf) PrimitiveU32(v.read_u32(0));
-            break;
-        case RawType::U64:
-            new(&rv.buf) PrimitiveU64(v.read_u64(0));
-            break;
-        case RawType::USize:
-            if( POINTER_SIZE == 8 )
-                new(&rv.buf) PrimitiveU64(v.read_u64(0));
-            else
-                new(&rv.buf) PrimitiveU32(v.read_u32(0));
-            break;
-
-        case RawType::I32:
-            new(&rv.buf) PrimitiveI32(v.read_i32(0));
-            break;
-        case RawType::I64:
-            new(&rv.buf) PrimitiveI64(v.read_i64(0));
-            break;
-        case RawType::ISize:
-            if( POINTER_SIZE == 8 )
-                new(&rv.buf) PrimitiveI64(v.read_i64(0));
-            else
-                new(&rv.buf) PrimitiveI32(v.read_i32(0));
-            break;
-        default:
-            LOG_TODO("PrimitiveValueVirt::from_value: " << t);
-        }
-        return rv;
-    }
-};
 
 struct Ops {
     template<typename T>
@@ -390,8 +162,8 @@ struct MirHelpers
                 if( alloc )
                 {
                     // TODO: It's valid to dereference (but not read) a non-null invalid pointer.
-                    LOG_ASSERT(ofs >= Allocation::PTR_BASE, "Dereferencing invalid pointer - " << ofs << " into " << alloc);
-                    ofs -= Allocation::PTR_BASE;
+                    LOG_ASSERT(ofs >= alloc.get_base(), "Dereferencing invalid pointer - " << ofs << " into " << alloc);
+                    ofs -= alloc.get_base();
                 }
                 else
                 {
@@ -517,7 +289,7 @@ struct MirHelpers
 
         // Create the pointer (can this just store into the target?)
         auto new_val = Value(dst_ty);
-        new_val.write_ptr(0, Allocation::PTR_BASE + ofs, ::std::move(alloc));
+        new_val.write_ptr_ofs(0, ofs, ::std::move(alloc));
         // - Add metadata if required
         if( meta != RawType::Unreachable )
         {
@@ -580,7 +352,7 @@ struct MirHelpers
         TU_ARM(c, Bytes, ce) {
             ty = ::HIR::TypeRef(RawType::U8).wrap(TypeWrapper::Ty::Slice, 0).wrap(TypeWrapper::Ty::Borrow, 0);
             Value val = Value(ty);
-            val.write_ptr(0, Allocation::PTR_BASE + 0, RelocationPtr::new_ffi(FFIPointer::new_const_bytes("Constant::Bytes", ce.data(), ce.size())));
+            val.write_ptr_ofs(0, 0, RelocationPtr::new_ffi(FFIPointer::new_const_bytes("Constant::Bytes", ce.data(), ce.size())));
             val.write_usize(POINTER_SIZE, ce.size());
             LOG_DEBUG(c << " = " << val);
             return val;
@@ -588,7 +360,7 @@ struct MirHelpers
         TU_ARM(c, StaticString, ce) {
             ty = ::HIR::TypeRef(RawType::Str).wrap(TypeWrapper::Ty::Borrow, 0);
             Value val = Value(ty);
-            val.write_ptr(0, Allocation::PTR_BASE + 0, RelocationPtr::new_string(&ce));
+            val.write_ptr_ofs(0, 0, RelocationPtr::new_string(&ce));
             val.write_usize(POINTER_SIZE, ce.size());
             LOG_DEBUG(c << " = " << val);
             return val;
@@ -604,7 +376,7 @@ struct MirHelpers
                 ty = s->ty.wrapped(TypeWrapper::Ty::Borrow, 0);
                 auto& val = this->thread.m_global.m_statics.at(s);
                 LOG_ASSERT(val.m_inner.is_alloc, "Statics should already have an allocation assigned");
-                return Value::new_pointer(ty, Allocation::PTR_BASE + 0, RelocationPtr::new_alloc(val.m_inner.alloc.alloc));
+                return Value::new_pointer_ofs(ty, 0, RelocationPtr::new_alloc(val.m_inner.alloc.alloc));
             }
             LOG_ERROR("Constant::ItemAddr - " << *ce << " - not found");
             } break;
@@ -688,8 +460,12 @@ GlobalState::GlobalState(const ModuleTree& modtree):
     // Hacky implementation of the mangling rules (doesn't support generics)
     auto fmt_ident = [](::std::ostream& os, const char* i) {
         if( const auto* hash = strchr(i, '#') ) {
-            os << "h" << (hash - i) << ::std::string(i, hash-i);
-            os << strlen(hash+1) << hash+1;
+            auto hofs = hash - i;
+            assert(hofs < 26);
+            os << char('A' + hofs);
+            os << strlen(i) - 1;
+            os << ::std::string(i, hash-i);
+            os << hash+1;
         }
         else {
             os << strlen(i) << i;
@@ -706,6 +482,12 @@ GlobalState::GlobalState(const ModuleTree& modtree):
         //std::cerr << ss.str() << std::endl;
         return RcString::new_interned(ss.str().c_str());
         };
+    auto push_override_std = [&](std::initializer_list<const char*> il, override_handler_t* cb) {
+        m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , il), cb));
+        m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0_H2", il), cb)); // 1.19
+        m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", il), cb));
+        m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0_H300", il), cb));   // 1.39
+        };
 
     override_handler_t* cb_nop = [](auto& state, auto& ret, const auto& path, auto args){
         return true;
@@ -716,17 +498,13 @@ GlobalState::GlobalState(const ModuleTree& modtree):
         ret = Value::new_i32(120);  //ERROR_CALL_NOT_IMPLEMENTED
         return true;
     };
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , {"sys", "imp", "c", "SetThreadStackGuarantee"}), cb_SetThreadStackGuarantee));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", {"sys", "imp", "c", "SetThreadStackGuarantee"}), cb_SetThreadStackGuarantee));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , {"sys", "windows", "c", "SetThreadStackGuarantee"}), cb_SetThreadStackGuarantee));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", {"sys", "windows", "c", "SetThreadStackGuarantee"}), cb_SetThreadStackGuarantee));
+    push_override_std( {"sys", "imp", "c", "SetThreadStackGuarantee"}, cb_SetThreadStackGuarantee );
+    push_override_std( {"sys", "windows", "c", "SetThreadStackGuarantee"}, cb_SetThreadStackGuarantee );
 
     // Win32 Shared RW locks (no-op)
     // TODO: Emulate fully for inter-thread locks
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , { "sys", "windows", "c", "AcquireSRWLockExclusive" }), cb_nop));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , { "sys", "windows", "c", "ReleaseSRWLockExclusive" }), cb_nop));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", { "sys", "windows", "c", "AcquireSRWLockExclusive" }), cb_nop));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", { "sys", "windows", "c", "ReleaseSRWLockExclusive" }), cb_nop));
+    push_override_std( { "sys", "windows", "c", "AcquireSRWLockExclusive" }, cb_nop );
+    push_override_std( { "sys", "windows", "c", "ReleaseSRWLockExclusive" }, cb_nop );
 
     // - No guard page needed
     override_handler_t* cb_guardpage_init = [](auto& state, auto& ret, const auto& path, auto args){
@@ -735,14 +513,11 @@ GlobalState::GlobalState(const ModuleTree& modtree):
         ret.write_u64(8, 0);
         return true;
     };
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , {"sys", "imp", "thread", "guard", "init" }), cb_guardpage_init));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", {"sys", "imp", "thread", "guard", "init" }), cb_guardpage_init));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , {"sys", "unix", "thread", "guard", "init" }), cb_guardpage_init));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", {"sys", "unix", "thread", "guard", "init" }), cb_guardpage_init));
+    push_override_std( {"sys", "imp", "thread", "guard", "init" }, cb_guardpage_init );
+    push_override_std( {"sys", "unix", "thread", "guard", "init" }, cb_guardpage_init );
 
     // - No stack overflow handling needed
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std"      , {"sys", "imp", "stack_overflow", "imp", "init"}), cb_nop));
-    m_fcn_overrides.insert(::std::make_pair( make_simplepath("std#0_0_0", {"sys", "imp", "stack_overflow", "imp", "init"}), cb_nop));
+    push_override_std( {"sys", "imp", "stack_overflow", "imp", "init"}, cb_nop );
 }
 
 // ====================================================================
@@ -1189,6 +964,8 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                     auto reloc_l = v_l.get_relocation(0);
                     auto reloc_r = v_r.get_relocation(0);
 
+                    // TODO: Stop treating the relocation as hidden information? Just use different pointers instead
+                    // - Each allocation has its own address range (track the ranges when an allocation is created/released)
 
                     // TODO: Handle comparison of the relocations too
                     // - If both sides have a relocation:
@@ -1202,17 +979,7 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                         // Both have relocations, check if they're equal
                         if( reloc_l != reloc_r )
                         {
-                            switch(re.op)
-                            {
-                            case ::MIR::eBinOp::EQ:
-                            case ::MIR::eBinOp::NE:
-                                res = 1;
-                                break;
-                            default:
-                                LOG_FATAL("Unable to compare " << v_l << " and " << v_r << " - different relocations (" << reloc_l << " != " << reloc_r << ")");
-                            }
-                            // - Equality will always fail
-                            // - Ordering is a bug
+                            res = (reloc_l < reloc_r ? -1 : 1);
                         }
                         else
                         {
@@ -1388,6 +1155,7 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                     // If the LHS had a relocation, propagate it over
                     if( auto r = v_l.get_relocation(0) )
                     {
+                        // TODO: Only propagate the allocation if the mask was of the high bits?
                         LOG_DEBUG("- Restore relocation " << r);
                         new_val.set_reloc(0, ::std::min(POINTER_SIZE, new_val.size()), r);
                     }
@@ -1406,22 +1174,39 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                         val_l.get().add( val_r.get() );
                         break;
                     case ::MIR::eBinOp::SUB:
-                        if( auto r = v_l.get_relocation(0) )
+                        val_l.get().subtract( val_r.get() );
+                        if( auto r_l = v_l.get_relocation(0) )
                         {
-                            if( v_r.get_relocation(0) )
+                            if( auto r_r = v_r.get_relocation(0) )
                             {
                                 // Pointer difference, no relocation in output
+                                if( r_l != r_r ) {
+                                    LOG_DEBUG("Different relocations: " << r_l << " and " << r_r);
+                                    if( r_l < r_r ) {
+                                        // Subtraction should result in a negative value (a large negative?)
+                                        // - Bias by `-r_r.size()`
+                                        auto ofs = (r_l.get_size() + 1 + 0x1000-1) & ~(0x1000-1);
+                                        val_l.get().add_imm(-static_cast<int64_t>(ofs));
+                                    }
+                                    else {
+                                        // - Bias by `r_r.size()`
+                                        auto ofs = (r_r.get_size() + 1 + 0x1000-1) & ~(0x1000-1);
+                                        val_l.get().add_imm(static_cast<int64_t>(ofs));
+                                    }
+                                }
+                                else {
+                                    LOG_DEBUG("Equal relocations: " << r_l << " and " << r_r);
+                                }
                             }
                             else
                             {
-                                new_val_reloc = ::std::move(r);
+                                new_val_reloc = ::std::move(r_l);
                             }
                         }
                         else
                         {
                             LOG_ASSERT(!v_r.get_relocation(0), "RHS of `-` has a relocation but LHS does not");
                         }
-                        val_l.get().subtract( val_r.get() );
                         break;
                     case ::MIR::eBinOp::MUL:    val_l.get().multiply( val_r.get() ); break;
                     case ::MIR::eBinOp::DIV:    val_l.get().divide( val_r.get() ); break;
@@ -1573,7 +1358,7 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                 size_t stride = inner_ty.get_size();
 
                 size_t ofs = 0;
-                for(size_t i = 0; i < re.count; i++)
+                for(size_t i = 0; i < re.count.count; i++)
                 {
                     new_val.write_value(ofs, state.param_to_value(re.val));
                     ofs += stride;
@@ -1643,10 +1428,17 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                 }
                 } break;
             }
-            LOG_DEBUG("- new_val=" << new_val);
+            LOG_DEBUG("F" << cur_frame.frame_index << " " << se.dst << " = " << new_val);
             state.write_lvalue(se.dst, ::std::move(new_val));
             } break;
-        case ::MIR::Statement::TAG_Asm:
+        TU_ARM(stmt, Asm, se) {
+            // An empty output list and empty clobber list is just a `black_box` anti-optimisation trick
+            if( se.tpl == "" && se.outputs.empty() ) {
+                break;
+            }
+            LOG_TODO(stmt);
+            } break;
+        case ::MIR::Statement::TAG_Asm2:
             LOG_TODO(stmt);
             break;
         TU_ARM(stmt, Drop, se) {
@@ -1662,7 +1454,7 @@ bool InterpreterThread::step_one(Value& out_thread_result)
 
                 auto ptr_ty = ty.wrapped(TypeWrapper::Ty::Borrow, /*BorrowTy::Unique*/2);
 
-                auto ptr_val = Value::new_pointer(ptr_ty, Allocation::PTR_BASE + ofs, ::std::move(alloc));
+                auto ptr_val = Value::new_pointer_ofs(ptr_ty, ofs, ::std::move(alloc));
                 if( v.m_metadata )
                 {
                     ptr_val.write_value(POINTER_SIZE, *v.m_metadata);
@@ -1854,6 +1646,25 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                     cur_frame.bb_idx = te.def_target;
                 }
                 }
+            TU_ARMA(ByteString, vals) {
+                auto size = v.read_usize(POINTER_SIZE);
+                const char* sv_ptr = reinterpret_cast<const char*>(v.read_pointer_const(0, size));
+                //auto switch_val = ::stdx::array_view(sv_ptr, sv_ptr+size);
+                auto switch_val = ::stdx::string_view(sv_ptr, sv_ptr+size);
+
+                auto it = ::std::find_if(vals.begin(), vals.end(), [&](const ::std::vector<uint8_t>& x){ return x.size() == size && memcmp(x.data(), sv_ptr, size) == 0; });
+                if( it != vals.end() )
+                {
+                    auto idx = it - vals.begin();
+                    LOG_TRACE("- b\"" << switch_val << "\" matched arm " << idx);
+                    cur_frame.bb_idx = te.targets.at(idx);
+                }
+                else
+                {
+                    LOG_TRACE("- b\"" << switch_val << "\" not matched, taking default arm");
+                    cur_frame.bb_idx = te.def_target;
+                }
+                }
             }
             }
         TU_ARM(bb.terminator, Call, te) {
@@ -1888,9 +1699,9 @@ bool InterpreterThread::step_one(Value& out_thread_result)
                     LOG_DEBUG("> Indirect call " << v);
                     // TODO: Assert type
                     // TODO: Assert offset/content.
-                    LOG_ASSERT(v.read_usize(0) == Allocation::PTR_BASE, "Function pointer value invalid - " << v);
                     fcn_alloc_ptr = v.get_relocation(0);
                     LOG_ASSERT(fcn_alloc_ptr, "Calling value with no relocation - " << v);
+                    LOG_ASSERT(v.read_usize(0) == fcn_alloc_ptr.get_base(), "Function pointer value invalid - " << v);
                     switch(fcn_alloc_ptr.get_ty())
                     {
                     case RelocationPtr::Ty::Function:
@@ -2063,562 +1874,31 @@ bool InterpreterThread::call_path(Value& ret, const ::HIR::Path& path, ::std::ve
 
     if( fcn.external.link_name != "" )
     {
-        // Search for a function with both code and this link name
-        if(const auto* ext_fcn = m_global.m_modtree.get_ext_function(fcn.external.link_name.c_str()))
+        const auto& name = fcn.external.link_name;
+        if(name == "__rust_allocate"
+            || name == "__rust_reallocate"
+            )
         {
-            this->m_stack.push_back(StackFrame(*ext_fcn, ::std::move(args)));
-            return false;
+            // Force using the `call_extern` version
         }
         else
         {
-            // External function!
-            return this->call_extern(ret, fcn.external.link_name, fcn.external.link_abi, ::std::move(args));
+            // Search for a function with both code and this link name
+            if(const auto* ext_fcn = m_global.m_modtree.get_ext_function(name.c_str()))
+            {
+                LOG_DEBUG("Matched extern - `" << name << "`");
+                this->m_stack.push_back(StackFrame(*ext_fcn, ::std::move(args)));
+                return false;
+            }
         }
+        // External function!
+        return this->call_extern(ret, name, fcn.external.link_abi, ::std::move(args));
     }
 
     this->m_stack.push_back(StackFrame(fcn, ::std::move(args)));
     return false;
 }
 
-bool InterpreterThread::call_intrinsic(Value& rv, const HIR::TypeRef& ret_ty, const RcString& name, const ::HIR::PathParams& ty_params, ::std::vector<Value> args)
-{
-    TRACE_FUNCTION_R(name, rv);
-    for(const auto& a : args)
-        LOG_DEBUG("#" << (&a - args.data()) << ": " << a);
-    if( name == "type_id" )
-    {
-        const auto& ty_T = ty_params.tys.at(0);
-        static ::std::vector<HIR::TypeRef>  type_ids;
-        auto it = ::std::find(type_ids.begin(), type_ids.end(), ty_T);
-        if( it == type_ids.end() )
-        {
-            it = type_ids.insert(it, ty_T);
-        }
-
-        rv = Value::with_size(POINTER_SIZE, false);
-        rv.write_usize(0, it - type_ids.begin());
-    }
-    else if( name == "type_name" )
-    {
-        const auto& ty_T = ty_params.tys.at(0);
-
-        static ::std::map<HIR::TypeRef, ::std::string>  s_type_names;
-        auto it = s_type_names.find(ty_T);
-        if( it == s_type_names.end() )
-        {
-            it = s_type_names.insert( ::std::make_pair(ty_T, FMT_STRING(ty_T)) ).first;
-        }
-
-        rv = Value::with_size(2*POINTER_SIZE, /*needs_alloc=*/true);
-        rv.write_ptr(0*POINTER_SIZE, Allocation::PTR_BASE, RelocationPtr::new_string(&it->second));
-        rv.write_usize(1*POINTER_SIZE, it->second.size());
-    }
-    else if( name == "discriminant_value" )
-    {
-        const auto& ty = ty_params.tys.at(0);
-        ValueRef val = args.at(0).deref(0, ty);
-
-        size_t fallback = SIZE_MAX;
-        size_t found_index = SIZE_MAX;
-        LOG_ASSERT(ty.inner_type == RawType::Composite, "discriminant_value " << ty);
-        const auto& dt = ty.composite_type();
-        for(size_t i = 0; i < dt.variants.size(); i ++)
-        {
-            const auto& var = dt.variants[i];
-            if( var.tag_data.size() == 0 )
-            {
-                // Only seen in Option<NonNull>
-                assert(fallback == SIZE_MAX);
-                fallback = i;
-            }
-            else
-            {
-                // Get offset to the tag
-                ::HIR::TypeRef  tag_ty;
-                size_t tag_ofs = ty.get_field_ofs(dt.tag_path.base_field, dt.tag_path.other_indexes, tag_ty);
-                // Compare
-                if( val.compare(tag_ofs, var.tag_data.data(), var.tag_data.size()) == 0 )
-                {
-                    found_index = i;
-                    break ;
-                }
-            }
-        }
-
-        if( found_index == SIZE_MAX )
-        {
-            LOG_ASSERT(fallback != SIZE_MAX, "Can't find variant of " << ty << " for " << val);
-            found_index = fallback;
-        }
-
-        rv = Value::new_usize(found_index);
-    }
-    else if( name == "atomic_fence" || name == "atomic_fence_acq" )
-    {
-        rv = Value();
-    }
-    else if( name == "atomic_store" || name == "atomic_store_relaxed" || name == "atomic_store_rel" )
-    {
-        auto& ptr_val = args.at(0);
-        auto& data_val = args.at(1);
-
-        LOG_ASSERT(ptr_val.size() == POINTER_SIZE, "atomic_store of a value that isn't a pointer-sized value");
-
-        // There MUST be a relocation at this point with a valid allocation.
-        auto alloc = ptr_val.get_relocation(0);
-        LOG_ASSERT(alloc, "Deref of a value with no relocation");
-
-        // TODO: Atomic side of this?
-        size_t ofs = ptr_val.read_usize(0) - Allocation::PTR_BASE;
-        alloc.alloc().write_value(ofs, ::std::move(data_val));
-    }
-    else if( name == "atomic_load" || name == "atomic_load_relaxed" || name == "atomic_load_acq" )
-    {
-        auto& ptr_val = args.at(0);
-        LOG_ASSERT(ptr_val.size() == POINTER_SIZE, "atomic_load of a value that isn't a pointer-sized value");
-
-        // There MUST be a relocation at this point with a valid allocation.
-        auto alloc = ptr_val.get_relocation(0);
-        LOG_ASSERT(alloc, "Deref of a value with no relocation");
-        // TODO: Atomic lock the allocation.
-
-        size_t ofs = ptr_val.read_usize(0) - Allocation::PTR_BASE;
-        const auto& ty = ty_params.tys.at(0);
-
-        rv = alloc.alloc().read_value(ofs, ty.get_size());
-    }
-    else if( name == "atomic_xadd" || name == "atomic_xadd_relaxed" )
-    {
-        const auto& ty_T = ty_params.tys.at(0);
-        auto ptr_ofs = args.at(0).read_usize(0) - Allocation::PTR_BASE;
-        auto ptr_alloc = args.at(0).get_relocation(0);
-        auto v = args.at(1).read_value(0, ty_T.get_size());
-
-        // TODO: Atomic lock the allocation.
-        if( !ptr_alloc || !ptr_alloc.is_alloc() ) {
-            LOG_ERROR("atomic pointer has no allocation");
-        }
-
-        // - Result is the original value
-        rv = ptr_alloc.alloc().read_value(ptr_ofs, ty_T.get_size());
-
-        auto val_l = PrimitiveValueVirt::from_value(ty_T, rv);
-        const auto val_r = PrimitiveValueVirt::from_value(ty_T, v);
-        val_l.get().add( val_r.get() );
-
-        val_l.get().write_to_value( ptr_alloc.alloc(), ptr_ofs );
-    }
-    else if( name == "atomic_xsub" || name == "atomic_xsub_relaxed" || name == "atomic_xsub_rel" )
-    {
-        const auto& ty_T = ty_params.tys.at(0);
-        auto ptr_ofs = args.at(0).read_usize(0) - Allocation::PTR_BASE;
-        auto ptr_alloc = args.at(0).get_relocation(0);
-        auto v = args.at(1).read_value(0, ty_T.get_size());
-
-        // TODO: Atomic lock the allocation.
-        if( !ptr_alloc || !ptr_alloc.is_alloc() ) {
-            LOG_ERROR("atomic pointer has no allocation");
-        }
-
-        // - Result is the original value
-        rv = ptr_alloc.alloc().read_value(ptr_ofs, ty_T.get_size());
-
-        auto val_l = PrimitiveValueVirt::from_value(ty_T, rv);
-        const auto val_r = PrimitiveValueVirt::from_value(ty_T, v);
-        val_l.get().subtract( val_r.get() );
-
-        val_l.get().write_to_value( ptr_alloc.alloc(), ptr_ofs );
-    }
-    else if( name == "atomic_xchg" || name == "atomic_xchg_acqrel" )
-    {
-        const auto& ty_T = ty_params.tys.at(0);
-        auto data_ref = args.at(0).read_pointer_valref_mut(0, ty_T.get_size());
-        const auto& new_v = args.at(1);
-
-        rv = data_ref.read_value(0, new_v.size());
-        data_ref.m_alloc.alloc().write_value( data_ref.m_offset, new_v );
-    }
-    else if( name == "atomic_cxchg" )
-    {
-        const auto& ty_T = ty_params.tys.at(0);
-        const auto& ret_dt = ret_ty.composite_type();
-        LOG_ASSERT(ret_dt.fields.size() == 2, "Return type of `atomic_cxchg` invalid");
-        LOG_ASSERT(ret_dt.fields[0].second == ty_T, "Return type of `atomic_cxchg` invalid");
-        //LOG_ASSERT(ret_dt.fields[1].second == HIR::CoreType::Bool);
-        // TODO: Get a ValueRef to the target location
-        auto data_ref = args.at(0).read_pointer_valref_mut(0, ty_T.get_size());
-        const auto& old_v = args.at(1);
-        const auto& new_v = args.at(2);
-        rv = Value( ret_ty );
-        rv.write_value(ret_dt.fields.at(0).first, data_ref.read_value(0, old_v.size()));
-        LOG_DEBUG("> *ptr = " << data_ref);
-        bool success = data_ref.compare(0, old_v.data_ptr(), old_v.size());
-        if( success == true ) {
-            data_ref.m_alloc.alloc().write_value( data_ref.m_offset, new_v );
-        }
-        rv.write_u8( ret_dt.fields.at(1).first, success ? 1 : 0 );
-    }
-    else if( name == "transmute" )
-    {
-        // Transmute requires the same size, so just copying the value works
-        rv = ::std::move(args.at(0));
-    }
-    else if( name == "assume" )
-    {
-        // Assume is a no-op which returns unit
-    }
-    else if( name == "offset" )
-    {
-        auto ptr_alloc = args.at(0).get_relocation(0);
-        auto ptr_ofs = args.at(0).read_usize(0);
-        LOG_ASSERT(ptr_ofs >= Allocation::PTR_BASE, "`offset` with invalid pointer - " << args.at(0));
-        auto& ofs_val = args.at(1);
-
-        auto delta_counts = ofs_val.read_usize(0);
-        auto ty_size = ty_params.tys.at(0).get_size();
-        LOG_DEBUG("\"offset\": 0x" << ::std::hex << ptr_ofs << " + 0x" << delta_counts << " * 0x" << ty_size);
-        ptr_ofs -= Allocation::PTR_BASE;
-        auto new_ofs = ptr_ofs + delta_counts * ty_size;
-        if(POINTER_SIZE != 8) {
-            new_ofs &= 0xFFFFFFFF;
-        }
-
-        rv = ::std::move(args.at(0));
-        rv.write_ptr(0, Allocation::PTR_BASE + new_ofs, ptr_alloc);
-    }
-    else if( name == "arith_offset" )   // Doesn't check validity, and allows wrapping
-    {
-        auto ptr_alloc = args.at(0).get_relocation(0);
-        auto ptr_ofs = args.at(0).read_usize(0);
-        //LOG_ASSERT(ptr_ofs >= Allocation::PTR_BASE, "`offset` with invalid pointer - " << args.at(0));
-        //ptr_ofs -= Allocation::PTR_BASE;
-        auto& ofs_val = args.at(1);
-
-        auto delta_counts = ofs_val.read_usize(0);
-        auto new_ofs = ptr_ofs + delta_counts * ty_params.tys.at(0).get_size();
-        if(POINTER_SIZE != 8) {
-            new_ofs &= 0xFFFFFFFF;
-        }
-        //new_ofs += Allocation::PTR_BASE;
-
-        rv = ::std::move(args.at(0));
-        if( ptr_alloc )
-        {
-            rv.write_ptr(0, new_ofs, ptr_alloc);
-        }
-        else
-        {
-            rv.write_usize(0, new_ofs);
-        }
-    }
-    // effectively ptr::write
-    else if( name == "move_val_init" )
-    {
-        auto& ptr_val = args.at(0);
-        auto& data_val = args.at(1);
-
-        // There MUST be a relocation at this point with a valid allocation.
-        // - TODO: What about FFI? (can't be a string or function though)
-        auto dst_vr = ptr_val.deref(0, ty_params.tys.at(0));
-        LOG_ASSERT(dst_vr.m_alloc, "Deref didn't yeild an allocation (error?)");
-        LOG_ASSERT(dst_vr.m_alloc.is_alloc(), "Deref didn't yield an allocation");
-
-        dst_vr.m_alloc.alloc().write_value(dst_vr.m_offset, ::std::move(data_val));
-    }
-    else if( name == "uninit" )
-    {
-        rv = Value(ty_params.tys.at(0));
-    }
-    else if( name == "init" )
-    {
-        rv = Value(ty_params.tys.at(0));
-        rv.mark_bytes_valid(0, rv.size());
-    }
-    else if( name == "write_bytes" )
-    {
-        auto& dst_ptr_v = args.at(0);
-        auto byte = args.at(1).read_u8(0);
-        auto count = args.at(2).read_usize(0);
-        auto bytes = count * ty_params.tys.at(0).get_size();
-
-        LOG_DEBUG("'write_bytes'(" << dst_ptr_v << ", " << (int)byte << ", " << count << "): bytes=" << bytes);
-
-        if( count > 0 )
-        {
-            auto dst_vr = dst_ptr_v.read_pointer_valref_mut(0, bytes);
-            memset(dst_vr.data_ptr_mut(), byte, bytes);
-            dst_vr.mark_bytes_valid(0, bytes);
-        }
-    }
-    // - Unsized stuff
-    else if( name == "size_of_val" )
-    {
-        auto& val = args.at(0);
-        const auto& ty = ty_params.tys.at(0);
-        rv = Value(::HIR::TypeRef(RawType::USize));
-        // Get unsized type somehow.
-        // - _HAS_ to be the last type, so that makes it easier
-        size_t fixed_size = 0;
-        if( const auto* ity = ty.get_unsized_type(fixed_size) )
-        {
-            const auto meta_ty = ty.get_meta_type();
-            LOG_DEBUG("size_of_val - " << ty << " ity=" << *ity << " meta_ty=" << meta_ty << " fixed_size=" << fixed_size);
-            size_t flex_size = 0;
-            if( const auto* w = ity->get_wrapper() )
-            {
-                LOG_ASSERT(w->type == TypeWrapper::Ty::Slice, "size_of_val on wrapped type that isn't a slice - " << *ity);
-                size_t item_size = ity->get_inner().get_size();
-                size_t item_count = val.read_usize(POINTER_SIZE);
-                flex_size = item_count * item_size;
-                LOG_DEBUG("> item_size=" << item_size << " item_count=" << item_count << " flex_size=" << flex_size);
-            }
-            else if( ity->inner_type == RawType::Str )
-            {
-                flex_size = val.read_usize(POINTER_SIZE);
-            }
-            else if( ity->inner_type == RawType::TraitObject )
-            {
-                auto vtable_ty = meta_ty.get_inner();
-                LOG_DEBUG("> vtable_ty = " << vtable_ty << " (size= " << vtable_ty.get_size() << ")");
-                auto vtable = val.deref(POINTER_SIZE, vtable_ty);
-                LOG_DEBUG("> vtable = " << vtable);
-                auto size = vtable.read_usize(1*POINTER_SIZE);
-                flex_size = size;
-            }
-            else
-            {
-                LOG_BUG("Inner unsized type unknown - " << *ity);
-            }
-
-            rv.write_usize(0, fixed_size + flex_size);
-        }
-        else
-        {
-            rv.write_usize(0, ty.get_size());
-        }
-    }
-    else if( name == "min_align_of_val" )
-    {
-        /*const*/ auto& val = args.at(0);
-        const auto& ty = ty_params.tys.at(0);
-        rv = Value(::HIR::TypeRef(RawType::USize));
-        size_t fixed_size = 0;  // unused
-        size_t flex_align = 0;
-        if( const auto* ity = ty.get_unsized_type(fixed_size) )
-        {
-            if( const auto* w = ity->get_wrapper() )
-            {
-                LOG_ASSERT(w->type == TypeWrapper::Ty::Slice, "align_of_val on wrapped type that isn't a slice - " << *ity);
-                flex_align = ity->get_inner().get_align();
-            }
-            else if( ity->inner_type == RawType::Str )
-            {
-                flex_align = 1;
-            }
-            else if( ity->inner_type == RawType::TraitObject )
-            {
-                const auto meta_ty = ty.get_meta_type();
-                auto vtable_ty = meta_ty.get_inner();
-                LOG_DEBUG("> vtable_ty = " << vtable_ty << " (size= " << vtable_ty.get_size() << ")");
-                auto vtable = val.deref(POINTER_SIZE, vtable_ty);
-                LOG_DEBUG("> vtable = " << vtable);
-                flex_align = vtable.read_usize(2*POINTER_SIZE);
-            }
-            else
-            {
-                LOG_BUG("Inner unsized type unknown - " << *ity);
-            }
-        }
-        rv.write_usize(0, ::std::max( ty.get_align(), flex_align ));
-    }
-    else if( name == "drop_in_place" )
-    {
-        auto& val = args.at(0);
-        const auto& ty = ty_params.tys.at(0);
-        return drop_value(val, ty);
-    }
-    else if( name == "try" )
-    {
-        auto fcn_path = args.at(0).get_relocation(0).fcn();
-        auto arg = args.at(1);
-        auto out_panic_value = args.at(2).read_pointer_valref_mut(0, POINTER_SIZE);
-
-        ::std::vector<Value>    sub_args;
-        sub_args.push_back( ::std::move(arg) );
-
-        this->m_stack.push_back(StackFrame::make_wrapper([=](Value& out_rv, Value /*rv*/)mutable->bool{
-            if( m_thread.panic_active )
-            {
-                assert(m_thread.panic_count > 0);
-                m_thread.panic_active = false;
-                m_thread.panic_count --;
-                LOG_ASSERT(m_thread.panic_value.size() == out_panic_value.m_size, "Panic value " << m_thread.panic_value << " doesn't fit in " << out_panic_value);
-                out_panic_value.m_alloc.alloc().write_value( out_panic_value.m_offset, ::std::move(m_thread.panic_value) );
-                out_rv = Value::new_u32(1);
-                return true;
-            }
-            else
-            {
-                LOG_ASSERT(m_thread.panic_count == 0, "Panic count non-zero, but previous function returned non-panic");
-                out_rv = Value::new_u32(0);
-                return true;
-            }
-            }));
-
-        // TODO: Catch the panic out of this.
-        if( this->call_path(rv, fcn_path, ::std::move(sub_args)) )
-        {
-            bool v = this->pop_stack(rv);
-            assert( v == false );
-            return true;
-        }
-        else
-        {
-            return false;
-        }
-    }
-    // ----------------------------------------------------------------
-    // Checked arithmatic
-    else if( name == "add_with_overflow" )
-    {
-        const auto& ty = ty_params.tys.at(0);
-
-        auto lhs = PrimitiveValueVirt::from_value(ty, args.at(0));
-        auto rhs = PrimitiveValueVirt::from_value(ty, args.at(1));
-        bool didnt_overflow = lhs.get().add( rhs.get() );
-
-        // Get return type - a tuple of `(T, bool,)`
-        const auto& dty = ret_ty.composite_type();
-
-        rv = Value(::HIR::TypeRef(&dty));
-        lhs.get().write_to_value(rv, dty.fields[0].first);
-        rv.write_u8( dty.fields[1].first, didnt_overflow ? 0 : 1 ); // Returns true if overflow happened
-    }
-    else if( name == "sub_with_overflow" )
-    {
-        const auto& ty = ty_params.tys.at(0);
-
-        auto lhs = PrimitiveValueVirt::from_value(ty, args.at(0));
-        auto rhs = PrimitiveValueVirt::from_value(ty, args.at(1));
-        bool didnt_overflow = lhs.get().subtract( rhs.get() );
-
-        // Get return type - a tuple of `(T, bool,)`
-        const auto& dty = ret_ty.composite_type();
-
-        rv = Value(::HIR::TypeRef(&dty));
-        lhs.get().write_to_value(rv, dty.fields[0].first);
-        rv.write_u8( dty.fields[1].first, didnt_overflow ? 0 : 1 ); // Returns true if overflow happened
-    }
-    else if( name == "mul_with_overflow" )
-    {
-        const auto& ty = ty_params.tys.at(0);
-
-        auto lhs = PrimitiveValueVirt::from_value(ty, args.at(0));
-        auto rhs = PrimitiveValueVirt::from_value(ty, args.at(1));
-        bool didnt_overflow = lhs.get().multiply( rhs.get() );
-
-        // Get return type - a tuple of `(T, bool,)`
-        const auto& dty = ret_ty.composite_type();
-
-        rv = Value(::HIR::TypeRef(&dty));
-        lhs.get().write_to_value(rv, dty.fields[0].first);
-        rv.write_u8( dty.fields[1].first, didnt_overflow ? 0 : 1 ); // Returns true if overflow happened
-    }
-    // - "exact_div" :: Normal divide, but UB if not an exact multiple
-    else if( name == "exact_div" )
-    {
-        const auto& ty = ty_params.tys.at(0);
-
-        auto lhs = PrimitiveValueVirt::from_value(ty, args.at(0));
-        auto rhs = PrimitiveValueVirt::from_value(ty, args.at(1));
-
-        LOG_ASSERT(!rhs.get().is_zero(), "`exact_div` with zero divisor: " << args.at(0) << " / " << args.at(1));
-        auto rem = lhs;
-        rem.get().modulo( rhs.get() );
-        LOG_ASSERT(rem.get().is_zero(), "`exact_div` with yielded non-zero remainder: " << args.at(0) << " / " << args.at(1));
-        bool didnt_overflow = lhs.get().divide( rhs.get() );
-        LOG_ASSERT(didnt_overflow, "`exact_div` failed for unknown reason: " << args.at(0) << " /" << args.at(1));
-
-        rv = Value(ty);
-        lhs.get().write_to_value(rv, 0);
-    }
-    // Overflowing artithmatic
-    else if( name == "overflowing_sub" )
-    {
-        const auto& ty = ty_params.tys.at(0);
-
-        auto lhs = PrimitiveValueVirt::from_value(ty, args.at(0));
-        auto rhs = PrimitiveValueVirt::from_value(ty, args.at(1));
-        lhs.get().subtract( rhs.get() );
-        // TODO: Overflowing part
-
-        rv = Value(ty);
-        lhs.get().write_to_value(rv, 0);
-    }
-    else if( name == "overflowing_add" )
-    {
-        const auto& ty = ty_params.tys.at(0);
-
-        auto lhs = PrimitiveValueVirt::from_value(ty, args.at(0));
-        auto rhs = PrimitiveValueVirt::from_value(ty, args.at(1));
-        lhs.get().add( rhs.get() );
-
-        rv = Value(ty);
-        lhs.get().write_to_value(rv, 0);
-    }
-    // ----------------------------------------------------------------
-    // memcpy
-    else if( name == "copy_nonoverlapping" )
-    {
-        //auto src_ofs = args.at(0).read_usize(0);
-        //auto src_alloc = args.at(0).get_relocation(0);
-        //auto dst_ofs = args.at(1).read_usize(0);
-        //auto dst_alloc = args.at(1).get_relocation(0);
-        size_t ent_count = args.at(2).read_usize(0);
-        size_t ent_size = ty_params.tys.at(0).get_size();
-        auto byte_count = ent_count * ent_size;
-        LOG_DEBUG("`copy_nonoverlapping`: byte_count=" << byte_count);
-
-        // A count of zero doesn't need to do any of the checks (TODO: Validate this rule)
-        if( byte_count > 0 )
-        {
-            auto src_vr = args.at(0).read_pointer_valref_mut(0, byte_count);
-            auto dst_vr = args.at(1).read_pointer_valref_mut(0, byte_count);
-
-            auto& dst_alloc = dst_vr.m_alloc;
-            LOG_ASSERT(dst_alloc, "Destination of copy* must be a memory allocation");
-            LOG_ASSERT(dst_alloc.is_alloc(), "Destination of copy* must be a memory allocation");
-
-            // TODO: is this inefficient?
-            auto src_val = src_vr.read_value(0, byte_count);
-            LOG_DEBUG("src_val = " << src_val);
-            dst_alloc.alloc().write_value(dst_vr.m_offset, ::std::move(src_val));
-        }
-    }
-    // ----------------------------------------------------------------
-    // Bit Twiddling
-    // ---
-    // cttz = CounT Trailing Zeroes
-    else if( name == "cttz_nonzero" )
-    {
-        const auto& ty_T = ty_params.tys.at(0);
-        auto v_inner = PrimitiveValueVirt::from_value(ty_T, args.at(0));
-        auto v = v_inner.get().as_u128();
-        unsigned n = 0;
-        while( (v & 1) == 0 && n < ty_T.get_size()*8 )
-        {
-            v = v >> static_cast<uint8_t>(1);
-            n ++;
-        }
-        rv = Value( HIR::TypeRef(RawType::USize) );
-        rv.write_usize(0, n);
-    }
-    else
-    {
-        LOG_TODO("Call intrinsic \"" << name << "\"");
-    }
-    return true;
-}
 
 // TODO: Use a ValueRef instead?
 bool InterpreterThread::drop_value(Value ptr, const ::HIR::TypeRef& ty, bool is_shallow/*=false*/)
@@ -2631,7 +1911,7 @@ bool InterpreterThread::drop_value(Value ptr, const ::HIR::TypeRef& ty, bool is_
         auto box_ptr_vr = ptr.read_pointer_valref_mut(0, POINTER_SIZE);
         auto ofs = box_ptr_vr.read_usize(0);
         auto alloc = box_ptr_vr.get_relocation(0);
-        if( ofs != Allocation::PTR_BASE || !alloc || !alloc.is_alloc() ) {
+        if( ofs != alloc.get_base() || !alloc || !alloc.is_alloc() ) {
             LOG_ERROR("Attempting to shallow drop with invalid pointer (no relocation or non-zero offset) - " << box_ptr_vr);
         }
 
@@ -2660,13 +1940,13 @@ bool InterpreterThread::drop_value(Value ptr, const ::HIR::TypeRef& ty, bool is_
             // No destructor
             break;
         case TypeWrapper::Ty::Slice: {
-            // - Get thin pointer and count
-            auto ofs = ptr.read_usize(0);
-            LOG_ASSERT(ofs >= Allocation::PTR_BASE, "");
-            auto ptr_reloc = ptr.get_relocation(0);
-            auto count = ptr.read_usize(POINTER_SIZE);
-
             auto ity = ty.get_inner();
+            // - Get thin pointer and count
+            auto count = ptr.read_usize(POINTER_SIZE);
+            auto ptr_vr = ptr.read_pointer_valref_mut(0, ity.get_size() * count);
+            auto ofs = ptr_vr.m_offset;
+            auto ptr_reloc = ptr_vr.m_alloc;
+
             auto pty = ity.wrapped(TypeWrapper::Ty::Borrow, static_cast<size_t>(::HIR::BorrowType::Move));
             for(uint64_t i = 0; i < count; i ++)
             {

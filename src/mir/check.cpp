@@ -12,6 +12,7 @@
 #include <hir_typeck/static.hpp>
 #include <mir/helpers.hpp>
 #include <mir/visit_crate_mir.hpp>
+#include <mir/operations.hpp>
 
 namespace {
     ::HIR::TypeRef get_metadata_type(const ::MIR::TypeResolve& state, const ::HIR::TypeRef& unsized_ty)
@@ -438,6 +439,21 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
                 for(const auto& v : stmt.as_Asm().outputs)
                     val_state.mark_validity( state, v.second, true );
                 break;
+            TU_ARM(stmt, Asm2, e) {
+                for(const auto& p : e.params)
+                {
+                    TU_MATCH_HDRA( (p), { )
+                    TU_ARMA(Const, v) {}
+                    TU_ARMA(Sym, v) {}
+                    TU_ARMA(Reg, v) {
+                        if(v.input)
+                            val_state.move_val(state, *v.input);
+                        if(v.output)
+                            val_state.mark_validity(state, *v.output, true);
+                        }
+                    }
+                }
+                } break;
             case ::MIR::Statement::TAG_Assign:
                 // Destination must be valid
                 for(const auto& w : stmt.as_Assign().dst.m_wrappers)
@@ -600,6 +616,17 @@ void MIR_Validate(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path
     ::MIR::TypeResolve   state { sp, resolve, FMT_CB(ss, ss << path;), ret_type, args, fcn };
     // Validation rules:
 
+    if( debug_enabled() ) MIR_Dump_Fcn(::std::cout, fcn);
+    
+    {
+        for(const auto& ty : fcn.locals)
+        {
+            if( !monomorphise_type_needed(ty) ) {
+                MIR_ASSERT(state, resolve.type_is_sized(sp, ty), "Local variable _" << (&ty - fcn.locals.data()) << ": " << ty << " isn't Sized");
+            }
+        }
+    }
+
     {
         for(const auto& bb : fcn.blocks)
         {
@@ -703,6 +730,7 @@ void MIR_Validate(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path
                     const auto& dst_ty = state.get_lvalue_type(dst_tmp, a.dst);
 
                     auto check_types = [&](const auto& dst_ty, const auto& src_ty) {
+                        DEBUG("check_types: " << dst_ty << " := " << src_ty);
                         if( src_ty == ::HIR::TypeRef::new_diverge() ) {
                             // It's valid to assign to anything from a !
                         }
@@ -826,8 +854,17 @@ void MIR_Validate(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path
                         }
                         }
                     TU_ARMA(SizedArray, e) {
+                        // NOTE: Something in liballoc does this with `MaybeUninit`, which is kinda a special case?
+#if 0
+                        if( e.count != 0u )
+                        {
+                            ::HIR::TypeRef  tmp;
+                            // Check that the input type is Copy
+                            const auto& src_ty = state.get_param_type(tmp, e.val);
+                            MIR_ASSERT(state, state.m_resolve.type_is_copy(state.sp, src_ty), "SizedArray with non-Copy type - " << src_ty << "; " << e.count);
+                        }
+#endif
                         // TODO: Check that return type is an array
-                        // TODO: Check that the input type is Copy
                         }
                     TU_ARMA(Borrow, e) {
                         ::HIR::TypeRef  tmp;
@@ -836,7 +873,98 @@ void MIR_Validate(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path
                     TU_ARMA(Cast, e) {
                         // Check return type
                         check_types( dst_ty, e.type );
-                        // TODO: Check suitability of source type (COMPLEX)
+
+                        // TODO: Move this to a function shared by the HIR (typecheck validate) and here
+
+                        ::HIR::TypeRef  tmp;
+                        const auto& src_ty = state.get_lvalue_type(tmp, e.val);
+                        // Check suitability of source type (COMPLEX)
+                        TU_MATCH_HDRA((src_ty.data()), {)
+                        default:
+                            MIR_BUG(state, "Invalid cast: " << dst_ty << " from " << src_ty);
+                        // Path: Only value enums
+                        TU_ARMA(Path, s_e) {
+                            MIR_ASSERT(state, s_e.binding.is_Enum(), "Invalid cast: " << dst_ty << " from " << src_ty);
+                            MIR_ASSERT(state, s_e.binding.as_Enum()->is_value(), "Invalid cast: " << dst_ty << " from " << src_ty);
+                            MIR_ASSERT(state, dst_ty.data().is_Primitive(), "Invalid cast: " << dst_ty << " from " << src_ty);
+                            }
+                        // Function pointers: can be casted to integers and to sized pointers
+                        TU_ARMA(Function, s_e) {
+                            //TU_MATCH_HDRA((dst_ty.data()), {)
+                            //default:
+                            //    MIR_BUG(state, "Invalid cast: " << dst_ty << " from " << src_ty);
+                            //TU_ARMA(Primitive, d_e) {
+                            //    MIR_ASSERT(state, d_e == HIR::CoreType::Usize, "Invalid cast: " << dst_ty << " from " << src_ty);
+                            //    }
+                            //}
+                            }
+                        // Primitives: Can cast to thin pointers or to other primitives
+                        TU_ARMA(Primitive, s_e) {
+                            MIR_ASSERT(state, s_e != HIR::CoreType::Str, "Casting from `str` is invalid");
+                            TU_MATCH_HDRA((dst_ty.data()), {)
+                            default:
+                                MIR_BUG(state, "Invalid cast: " << dst_ty << " from " << src_ty);
+                            TU_ARMA(Pointer, d_e) {
+                                switch(s_e)
+                                {
+                                case ::HIR::CoreType::Str:
+                                case ::HIR::CoreType::Char:
+                                case ::HIR::CoreType::F32:
+                                case ::HIR::CoreType::F64:
+                                    MIR_BUG(state, "Invalid cast: " << dst_ty << " from " << src_ty);
+                                    break;
+                                default:
+                                    break;
+                                }
+                                auto d_meta = state.m_resolve.metadata_type(state.sp, d_e.inner);
+                                MIR_ASSERT(state, d_meta == MetadataType::None || d_meta == MetadataType::Zero, "Casting primitive to invalid pointer type: " << dst_ty << " from " << src_ty);
+                                }
+                            TU_ARMA(Primitive, d_e) {
+                                MIR_ASSERT(state, d_e != HIR::CoreType::Str, "Casting to `str` is invalid");
+                                if(d_e == HIR::CoreType::Char)
+                                    MIR_ASSERT(state, s_e == HIR::CoreType::U8, "Invalid cast: " << dst_ty << " from " << src_ty);
+                                }
+                            }
+                            }
+                        // Can cast to a matching raw pointer
+                        TU_ARMA(Borrow, s_e) {
+                            MIR_ASSERT(state, dst_ty.data().is_Pointer(), "Casting borrow to invalid type: " << dst_ty << " from " << src_ty);
+                            MIR_ASSERT(state, dst_ty.data().as_Pointer().type <= s_e.type, "Casting borrow to invalid type: " << dst_ty << " from " << src_ty);
+                            MIR_ASSERT(state, dst_ty.data().as_Pointer().inner == s_e.inner, "Casting borrow to invalid type: " << dst_ty << " from " << src_ty);
+                            }
+                        // Pointers: Can either be casted to another pointer, or to integers
+                        TU_ARMA(Pointer, s_e) {
+                            auto s_meta = state.m_resolve.metadata_type(state.sp, s_e.inner);
+                            TU_MATCH_HDRA((dst_ty.data()), {)
+                            default:
+                                MIR_BUG(state, "Invalid cast: " << dst_ty << " from " << src_ty);
+                            TU_ARMA(Pointer, d_e) {
+                                // Only valid if metadata matches, or destination is thin
+                                if( s_e.inner != d_e.inner )
+                                {
+                                    auto d_meta = state.m_resolve.metadata_type(state.sp, d_e.inner);
+                                    if(d_meta != MetadataType::None && d_meta != MetadataType::Zero ) {
+                                        MIR_ASSERT(state, d_meta == s_meta, "Casting has mismatched metadata: " << dst_ty << " from " << src_ty);
+                                    }
+                                }
+                                }
+                            TU_ARMA(Primitive, d_e) {
+                                switch(d_e)
+                                {
+                                case ::HIR::CoreType::Str:
+                                case ::HIR::CoreType::Char:
+                                case ::HIR::CoreType::F32:
+                                case ::HIR::CoreType::F64:
+                                    MIR_BUG(state, "Casting pointer to invalid type: " << dst_ty << " from " << src_ty);
+                                    break;
+                                default:
+                                    MIR_ASSERT(state, s_meta == MetadataType::None || s_meta == MetadataType::Zero, "Casting fat pointer to integer: " << dst_ty << " from " << src_ty);
+                                    break;
+                                }
+                                }
+                            }
+                            }
+                        }
                         }
                     TU_ARMA(BinOp, e) {
                         /*
@@ -927,19 +1055,27 @@ void MIR_Validate(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path
                         // TODO: Check return type
                         }
                     TU_ARMA(MakeDst, e) {
+                        if( TU_TEST2(e.meta_val, Constant, ,ItemAddr, .get() == nullptr) ) {
+                            // TODO: Check the validity?
+                            // - Ensure that something is generic in either the destination or source 
+                            //::HIR::TypeRef  tmp;
+                            //const auto& src_ty = state.get_param_type(tmp, e.ptr_val);
+                            //MIR_ASSERT(state, monomorphise_type_needed(src_ty), "MakeDst Unsize with known source - " << src_ty);
+                            break;
+                        }
                         const ::HIR::TypeRef*   ity_p = nullptr;
                         if( const auto* te = dst_ty.data().opt_Borrow() )
                             ity_p = &te->inner;
                         else if( const auto* te = dst_ty.data().opt_Pointer() )
                             ity_p = &te->inner;
                         else {
-                            MIR_BUG(state, "DstMeta requires a pointer as output, got " << dst_ty);
+                            MIR_BUG(state, "MakeDst requires a pointer as output, got " << dst_ty);
                         }
                         assert(ity_p);
                         auto meta = get_metadata_type(state, *ity_p);
                         if( meta == ::HIR::TypeRef() )
                         {
-                            MIR_BUG(state, "DstMeta requires a pointer to an unsized type as output, got " << dst_ty);
+                            MIR_BUG(state, "MakeDst requires a pointer to an unsized type as output, got " << dst_ty);
                         }
                         // TODO: Check metadata type?
 
@@ -972,6 +1108,7 @@ void MIR_Validate(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path
                     }
                     } break;
                 case ::MIR::Statement::TAG_Asm:
+                case ::MIR::Statement::TAG_Asm2:
                     // TODO: Ensure that values are all thin pointers or integers?
                     break;
                 case ::MIR::Statement::TAG_Drop:
@@ -1072,7 +1209,15 @@ void MIR_Validate(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path
                         const auto& in_ty = state.get_param_type(tmp1, e.args[i]);
                         const auto& exp_ty = maybe_monomorph(fcn.m_args[i].second);
                         DEBUG("Arg " << i << " " << in_ty << " ?= " << exp_ty);
-                        MIR_ASSERT(state, in_ty == exp_ty, "Argument (" << i << ") type mismatch: input is " << in_ty << ", but expected is " << exp_ty);
+                        if( in_ty == ::HIR::TypeRef::new_diverge() ) {
+                            // It's valid to assign to anything from a !
+                        }
+                        else if( in_ty == exp_ty ) {
+                            // Types are equal, good.
+                        }
+                        else {
+                            MIR_BUG(state,  "Argument (" << i << ") type mismatch: input is " << in_ty << ", but expected is " << exp_ty);
+                        }
                     }
                     // Check return
                     const auto& slot_ty = state.get_lvalue_type(tmp1, e.ret_val);

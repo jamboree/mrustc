@@ -36,7 +36,7 @@ struct CheckFailure:
 {
 };
 
-#define MIR_BUG(state, ...) do { (state).print_bug( [&](auto& _os){_os << __VA_ARGS__; } ); throw ""; } while(0)
+#define MIR_BUG(state, ...) do { const char* __fcn = __FUNCTION__; (state).print_bug( [&](auto& _os){_os << __fcn << ": " << __VA_ARGS__; } ); throw ""; } while(0)
 #define MIR_ASSERT(state, cnd, ...) do { if( !(cnd) ) (state).print_bug( [&](auto& _os){_os << __FILE__ << ":" << __LINE__ << " ASSERT " #cnd " failed - " << __VA_ARGS__; } ); } while(0)
 #define MIR_TODO(state, ...) do { (state).print_todo( [&](auto& _os){_os << __VA_ARGS__; } ); throw ""; } while(0)
 #define MIR_DEBUG(state, ...) do { DEBUG(FMT_CB(_ss, (state).fmt_pos(_ss);) << __VA_ARGS__); } while(0)
@@ -335,7 +335,11 @@ namespace visit {
                 }
             TU_ARMA (MakeDst, se) {
                 rv |= visit_param(se.ptr_val, ValUsage::Move);
-                rv |= visit_param(se.meta_val, ValUsage::Move);
+                if( TU_TEST2(se.meta_val, Constant, ,ItemAddr, .get() == nullptr) ) {
+                }
+                else {
+                    rv |= visit_param(se.meta_val, ValUsage::Move);
+                }
                 }
             TU_ARMA(Tuple, se) {
                 for(auto& v : se.vals)
@@ -375,6 +379,23 @@ namespace visit {
                     rv |= visit_lvalue(v.second, ValUsage::Read);
                 for(auto& v : e.outputs)
                     rv |= visit_lvalue(v.second, ValUsage::Write);
+                }
+            TU_ARMA(Asm2, e) {
+                for(auto& p : e.params)
+                {
+                    TU_MATCH_HDRA( (p), { )
+                    TU_ARMA(Const, v)
+                        rv |= visit_const(v);
+                    TU_ARMA(Sym, v)
+                        /*rv |= */visit_path(v);
+                    TU_ARMA(Reg, v) {
+                        if(v.input)
+                            rv |= visit_param(*v.input, ValUsage::Read);
+                        if(v.output)
+                            rv |= visit_lvalue(*v.output, ValUsage::Write);
+                        }
+                    }
+                }
                 }
             TU_ARMA(SetDropFlag, e) {
                 }

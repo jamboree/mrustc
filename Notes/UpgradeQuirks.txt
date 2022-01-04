@@ -1,0 +1,47 @@
+=== 1.54 ===
+
+- `panic` macro, pointing it at a `pub macro` in `pub mod panic`
+- `#[macro_export] macro` (slightly different rules to `macro_rules!` version)
+- new `asm` macro
+- `pub use bool` to import the primitive type, not a module
+- Trait aliases
+- Or patterns
+  > Hard question between having combinatorial explosion from expanding or patterns early (in HIR generation), or serious changes in destructuring logic.
+- Extended use of const generics
+  - Now need value inferrence
+  - Used in array initialisation
+- New language-provided trait impls
+- Lots of new `const fn` constructs
+- Updated `?` operator
+- Use of `!` as a type more (`e.into()` where `E: Into<!>`)
+- Right-exclusive range patterns
+- Destructuring assignment added (used in `liballoc`)
+- `#[cfg]` on function arguments (and struct patterns)
+- Custom receivers (Pin) used with inherent impls
+- More advanced use of closures locally (broke usage logic)
+- atomic pointer ops
+- `alloc_error_handler`
+- `Box<T>` now has an allocator param
+- `cfg(feature="foo")` in Cargo.toml target dependencies
+- `$crate` within nested macro (macro defined by a macro)
+- `#[rustc_legacy_const_generics]`
+- Exporting of macro-defined macros (interpolated expressions)
+- `self.foo()` where `Self` implements two traits wtih a `foo` method, one of which is the current impl
+- Nested macro expansion edition hygiene
+- Variables in constants/statics
+- `#[track_caller]` for panics
+- `return (1 << shift).abs();` - Literal inference through a method call (likely actually uses traits, implemented using inherents)
+- Nested function using traits from parent function
+- Extra-nested macro patterns
+- `chalk_derive` is pendantic on `struct Binders<T: HasInterner> { ... }`, and doesn't work with `struct Binders<T> where T: HasInterner { ... }`
+- `chalk-ir` uses `Enum::<TypeParam>::Variant` instead of `Enum::Variant::<TypeParam>`
+- Type recursion in `chalk_solve`, see TypecheckIssues
+- Enum patterns in arguments (e.g. `Ok` when `E=!`)
+- Implicit formatting arguments (e.g `format!("{foo}")`)
+- `mrustc` being better at packing enums than `rustc` (so makes smaller structs than rustc was expecting)
+- `[x0 @ xn] | [x0, .., xn] => ` : Multiple bindings for a single value.
+- Right-open pattern ranges `foo..`
+- Trait-provided associated types
+- Type alias that expands its generic parameter twice
+  - Defer type aliases (and resolve ufcs) to during main typecheck?
+  - OR, allocate ivars really early

@@ -604,3 +604,224 @@ Typecheck Expressions-      `anonymous-namespace'::check_associated:  for ::"rus
 ```
 
 Had forgotten to run EAT on the impl type (had already run it on trait params, but not on the type)
+
+
+
+
+# (1.54) `<::"core-0_0_0"::result::Result<T/*I:0*/,E/*I:1*/,>/*E*/>::into_ok`
+Uses `!` as a type, which kinda breaks with some of the type inferrence
+- Looks like coercions are being done first, which means that the method call's return coercion site isn't being propagated fast enough
+- Leading to a method lookup failure as the return type of `e.into()` is "known" to be `T` (but it's actually `!`)
+
+```
+Typecheck Expressions-     check_ivar_poss: >> (4)
+Typecheck Expressions-      `anonymous-namespace'::check_ivar_poss: 4: possible_tys = -D T/*I:0*/
+Typecheck Expressions-      `anonymous-namespace'::check_ivar_poss: 4: bounds = +, !
+```
+
+## EXPERIMENT: Move node revisits to first in the typecheck cycle
+Failed in 1.39 std, `..\rustc-1.39.0-src\src\libstd\sys_common\thread.rs:14: error:0:Failed to find an impl of ::"core-0_0_0"::ops::function::Fn<(),> for ::"alloc-0_0_0"::boxed::Box<::"alloc-0_0_0"::boxed::Box<(::"core-0_0_0"::ops::function::FnOnce<(),>+ ''_),>,> with Output = ()`
+
+## EXPERIMENT: Remove short-circuit for `T = _` in `check_coerce_tys`
+Fails early in libcore 1.39, because other users of `check_coerce_tys` don't get info on the weak equality
+
+## EXPERIMENT: Add weak equality return to `check_coerce_tys`
+- Use this to defer the equality action
+
+## EXPERIMENT: Remove short-circuit for `T = _` in `check_coerce_tys`, AND remember to add possibility
+- Lots of other breakage?
+
+
+## EXPERIMENT: Treat `!` as a full type (remove special case handling in ivars)
+- Requires special handling in `check_ivar_poss` (ignore completely? Add as final fallback?)
+- Coerce rule `! := *` becomes equality
+- Some other additions required to handle inference breakage for `!` (e.g. around block returns)
+
+
+# (1.54) `<i8 as ::"num_integer-0_1_44"::Integer>::gcd`
+Calling a method on an integer ivar leading to ambigious lookup. mrustc returns all the inherent methods (with no auto-ref) so doesn't see the trait method (which requires one)
+```
+return (1 << shift).abs();
+```
+
+## EXPERIMENT: Hack avoid inherent methods on bounded ivars (in `find_method)
+- libcore fails looking for `saturating_sub`
+## EXPERIMENT: Hack avoid inherent methods on bounded ivars (in `visit(_Method)`)
+- Failed libcore again first try
+- Limited only to fallback mode (and only if it doesn't remove eveything).
+- Worked.
+
+# (1.54) 
+```
+fn compute_lifetime_flags<I: Interner>(lifetime: &Lifetime<I>, interner: &I) -> TypeFlags { ... }
+
+fn compute_flags<I: Interner>(kind: &TyKind<I>, interner: &I) -> TypeFlags {
+   ...
+   dyn_flags |= compute_lifetime_flags(&(lifetime_outlives.a), &interner)
+```
+Passes `&interner` but there's no `Interner for &I` impl (so trait bound fails)
+
+```
+Typecheck Expressions-    check_ivar_poss: >> (202)
+Typecheck Expressions-     `anonymous-namespace'::check_ivar_poss: One possibility (before ivar removal), setting to &I/*M:0*/
+Typecheck Expressions-      HMTypeInferrence::set_ivar_to: Set IVar 202 = &I/*M:0*/
+```
+
+## Experiment: When picking a lone possibility (and it is dereferencable), check that it meets bounds and deref until it does
+- Simple check and loop.
+- Seems to have worked
+
+# (1.54) `::"chalk_solve-0_55_0_H7"::clauses::push_alias_implemented_clause`
+```rs
+// chalk-ir-0.55.0/src/lib.rs
+#[derive(..., HasInterner)]
+pub struct Ty<I: Interner> {
+    interned: I::InternedType,
+}
+// chalk-ir-0.55.0/src/lib.rs
+impl<T: HasInterner> Binders<T> {
+    ...
+    pub fn with_fresh_type_var(
+            interner: &T::Interner,
+            op: impl FnOnce(Ty<T::Interner>) -> T,
+        ) -> Binders<T> { ... }
+    ...
+}
+
+// chalk-solve-0.55.0/src/clauses.rs
+let binders = Binders::with_fresh_type_var(interner, |ty_var| ty_var);
+```
+Leads to a self-recursive type
+- `T` = `Ty<T::Interner>`
+- `T` = `Ty<?>`
+- This type isn't know around this point, requires some downstream bounds to work.
+
+## Added anti-recursion guards
+```
+..\rustc-1.54.0-src\vendor\chalk-solve-0.55.0\src\clauses.rs:761: warn:0:Spare Rule - &<::"chalk_ir-0_55_0"::Ty<</*RECURSE*/ as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner,> as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner := &I/*M:0*/
+..\rustc-1.54.0-src\vendor\chalk-solve-0.55.0\src\clauses.rs:753: warn:0:Spare Rule - <::"chalk_ir-0_55_0"::Ty<</*RECURSE*/ as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner,> as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner : ::"chalk_ir-0_55_0"::interner::Interner
+..\rustc-1.54.0-src\vendor\chalk-solve-0.55.0\src\clauses.rs:781: warn:0:Spare Rule - I/*M:0*/ = < ::"chalk_ir-0_55_0"::Ty<<::"chalk_ir-0_55_0"::Ty</*RECURSE*/,> as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner,> as ::"chalk_ir-0_55_0"::interner::HasInterner >::Interner
+:0: BUG:..\..\src\hir_typeck\expr_cs.cpp:7313: Spare rules left after typecheck stabilised
+```
+
+Probably the ivar for `Binders_T` shouldn't have been expanded/assigned to be `Ty<Binders_T>::Interner` (so the rule above doing `&<Ty<Binders_T>::Interner> = &I` would set it to `I` correctly via `Ty<T>::Interner == T`)
+
+
+## HACK: Updating the source worked
+```
+let binders = Binders::with_fresh_type_var(interner, |ty_var| ty_var);
+```
+to
+```
+let binders = Binders::<Ty<I>>::with_fresh_type_var(interner, |ty_var| ty_var);
+```
+
+So, from that `Binders_T = Ty<I>`
+
+## Error source: Generating the loop
+```
+Typecheck Expressions-      check_coerce: >> (R26 _/*155*/ := 000001BE70835FD0 000001BE75D536A0 (::"chalk_ir-0_55_0"::Ty<<_/*155*/ as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner/*?*/,>/*S*/) - _/*155*/ := ::"chalk_ir-0_55_0"::Ty<<_/*155*/ as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner,>)
+Typecheck Expressions-       check_coerce_tys: >> (_/*155*/ := ::"chalk_ir-0_55_0"::Ty<<_/*155*/ as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner/*?*/,>/*S*/)
+Typecheck Expressions-       check_coerce_tys: << ()
+Typecheck Expressions-       `anonymous-namespace'::check_coerce: Trigger equality - Completed
+Typecheck Expressions-        HMTypeInferrence::set_ivar_to: Set IVar 155 = ::"chalk_ir-0_55_0"::Ty<<_/*155*/ as ::"chalk_ir-0_55_0"::interner::HasInterner>::Interner/*?*/,>/*S*/
+```
+Before allowing an assignment in `check_coerce` (especially of an ivar), check if it would trigger recursion (i.e. the mentioned ivar is in the target type, but the types aren't equal)
+- If it does, defer the coercion once more.
+- Worked, in that it didn't cause the loop, but still has a failure to infer.
+- Not consuming `R26` means that `_/*155*/` isn't inferred to be a `Ty<...>`
+  - Could detect the potential loop and introduce a new ivar for the param to `Ty`?
+    - Check/ensure that there is a UfcsKnown in the looping variable
+    - Replace the UfcsKnown with a new ivar (and add a ATY rule for it)
+ - Worked!
+ - Moved the anti-recursion to `Context::equate_types` (where it works all the time, and is less expensive to implement)
+
+# (1.54) `::"rustc_middle-0_0_0"::middle::limits::update_limit`
+```
+..\rustc-1.54.0-src\compiler\rustc_middle\src\middle\limits.rs:54: error:0:Type mismatch between ::"core-0_0_0"::num::error::IntErrorKind and &::"core-0_0_0"::num::error::IntErrorKind
+```
+
+`.parse()` result type only inferred through a `From::from` call, leads to the match default being applied (via ivar possibilities) before the parse result type is known (and thus the error type is known).
+
+Query: `parse()`'s result should be known, and the error type should be an aty bound.
+- BUT, there's a method call on that ATY/UfcsKnown bound, which is the thing being inferred.
+- So, why does the result type not infer beforehand?
+
+Solution: If there's an ivar with only one possibility, and we're in a fallback mode - then pick that possibility (if it fits available bounds)
+- This leads to the coercions being traversed earlier, thus avoiding the inference race.
+
+
+# (1.54) `<::"rustc_mir_build-0_0_0"::build::Builder/*S*/>::bind_pattern`
+```
+..\rustc-1.54.0-src\compiler\rustc_mir_build\src\build\matches/mod.rs:387: error:0:Failed to find an impl of ::"core-0_0_0"::ops::function::FnOnce<(::"rustc_mir_build-0_0_0"::build::matches::Candidate,&mut _/*93*/,),> for {000002938DE60E10}(::"rustc_mir_build-0_0_0"::build::matches::Candidate,&[(::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Binding,::"alloc-0_0_0"::alloc::Global,>,::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Ascription,::"alloc-0_0_0"::alloc::Global,>,)],)->() with Output = ()
+```
+
+Early-infer of the closure's argument type, before the expected argument type information was available.
+```
+Typecheck Expressions-     Context::dump: R11 &mut _/*95*/ := 000002938C755870 000002938C7548E0 (&mut {000002938DE60E10}(_/*39*/,_/*40*/,)->_/*30*/)
+Typecheck Expressions-           Context::equate_types_assoc: ++ R4 () = < `_/*95*/` as `::"core-0_0_0"::ops::function::FnOnce<(_/*92*/, &mut _/*93*/, ),>` >::Output
+Typecheck Expressions-     check_ivar_poss: >> (40)
+Typecheck Expressions-      `anonymous-namespace'::check_ivar_poss: 40: possible_tys = C- &[(::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Binding/*S*/,::"alloc-0_0_0"::alloc::Global/*S*/,>/*S*/, ::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Ascription/*S*/,::"alloc-0_0_0"::alloc::Global/*S*/,>/*S*/, )]
+Typecheck Expressions-      `anonymous-namespace'::check_ivar_poss: Only &[(::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Binding/*S*/,::"alloc-0_0_0"::alloc::Global/*S*/,>/*S*/, ::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Ascription/*S*/,::"alloc-0_0_0"::alloc::Global/*S*/,>/*S*/, )] is an option
+Typecheck Expressions-       HMTypeInferrence::set_ivar_to: Set IVar 40 = &[(::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Binding/*S*/,::"alloc-0_0_0"::alloc::Global/*S*/,>/*S*/, ::"alloc-0_0_0"::vec::Vec<::"rustc_mir_build-0_0_0"::build::matches::Ascription/*S*/,::"alloc-0_0_0"::alloc::Global/*S*/,>/*S*/, )]
+Typecheck Expressions-      `anonymous-namespace'::check_ivar_poss: One possibility (before ivar removal), setting to closure[000002938DE60E10](_/*39*/, _/*40*/, ) -> ()
+Typecheck Expressions-       HMTypeInferrence::set_ivar_to: Set IVar 95 = closure[000002938DE60E10](_/*39*/, _/*40*/, ) -> ()
+Typecheck Expressions-     Typecheck_Code_CS: - R4 () = < `_/*95*/` as `::"core-0_0_0"::ops::function::FnOnce<(::"rustc_mir_build-0_0_0"::build::matches::Candidate/*S*/, &mut _/*93*/, ),>` >::Output
+```
+
+Need to prevent auto-inferring of closure argument types? (bound them to include self?)
+- Challenge: Closures aren't revisited (currently)
+- HACK: Do a disable on closures when being unsized to an ivar.
+
+
+# (1.54) `<::"schannel-0_1_19"::security_context::SecurityContext/*S*/>::attribute`
+```
+..\rustc-1.54.0-src\vendor\schannel\src\security_context.rs:101: error:0:Type mismatch between T/*M:0*/ and ::"core-0_0_0"::ffi::c_void
+```
+
+```
+Typecheck Expressions-         Context::equate_types_coerce: ++ R6 _/*35*/ := 000001D9AD738D70 000001D9BC0014E0 (_/*24*/)
+Typecheck Expressions-     check_coerce: >> (R10 ::"core-0_0_0"::result::Result<T/*M:0*/,::"std-0_0_0"::io::error::Error/*S*/,>/*E*/ := 000000A6D912E5A8 000001D9BA421FC0 (::"core-0_0_0"::result::Result<_/*35*/,::"std-0_0_0"::io::error::Error/*S*/,>/*E*/) - ::"core-0_0_0"::result::Result<T/*M:0*/,::"std-0_0_0"::io::error::Error,> := ::"core-0_0_0"::result::Result<_/*35*/,::"std-0_0_0"::io::error::Error,>)
+Typecheck Expressions-       HMTypeInferrence::set_ivar_to: Set IVar 35 = T/*M:0*/
+Typecheck Expressions-     visit: >> (*mut _/*13*/ as *mut ::"core-0_0_0"::ffi::c_void/*E*/)
+Typecheck Expressions-       HMTypeInferrence::set_ivar_to: Set IVar 13 = ::"core-0_0_0"::ffi::c_void/*E*/
+Typecheck Expressions-     check_coerce: >> (R6 T/*M:0*/ := 000001D9AD738D70 000001D9BC0014E0 (::"core-0_0_0"::ffi::c_void/*E*/) - T/*M:0*/ := ::"core-0_0_0"::ffi::c_void)
+Typecheck Expressions-       Context::equate_types_inner: - l_t = T/*M:0*/, r_t = ::"core-0_0_0"::ffi::c_void/*E*/
+```
+
+```
+Typecheck Expressions-     check_ivar_poss: >> (13)
+Typecheck Expressions-      `anonymous-namespace'::check_ivar_poss: - Source/Destination type
+Typecheck Expressions-      Context::equate_types: _/*13*/ == _/*13*/
+Typecheck Expressions-     check_ivar_poss: << ()
+Typecheck Expressions-     Context::possible_equate_ivar_unknown: 13 = ?? (From)
+Typecheck Expressions-     Context::possible_equate_ivar_unknown: 13 = ?? (To)
+Typecheck Expressions-     Typecheck_Code_CS: --- IVar possibilities (fallback 1)
+```
+
+Solution: check if the equal source/destination is the current type, and skip if so.
+
+# (1.54) `::"cargo_util-0_1_0"::paths::write_if_changed`
+```
+..\rustc-1.54.0-src\src\tools\cargo\crates\cargo-util\src\paths.rs:183: warn:0:Spare Rule - _/*2*/ : ::"anyhow-1_0_40_H2"::context::ext::StdError
+..\rustc-1.54.0-src\src\tools\cargo\crates\cargo-util\src\paths.rs:183: warn:0:Spare Rule - _/*2*/ : ::"core-0_0_0"::marker::Send
+:0: warn:0:Spare Rule - _/*2*/ : ::"core-0_0_0"::convert::From<::"std-0_0_0"::io::error::Error/*S*/,>
+..\rustc-1.54.0-src\src\tools\cargo\crates\cargo-util\src\paths.rs:183: warn:0:Spare Rule - _/*2*/ : ::"core-0_0_0"::marker::Sync
+:0: BUG:..\..\src\hir_typeck\expr_cs.cpp:7391: Spare rules left after typecheck stabilised
+```
+
+```
+Typecheck Expressions-            equate_types: >> (_/*91*/ == closure[000001DF369EA8E0]() -> ::"core-0_0_0"::result::Result<(),_/*2*/,>/*E*/)
+```
+
+Looks like a name resolution error, used `std::result::Result` instead of `anyhow::Result`. Also, didn't error properly when `Result<()>` was seen (should require all or none)
+- Resolve is correct (points at `anyhow`'s `Result`), but HIR dump shows closure result as not having the error set
+- "Resolve Type Aliases"
+
+```
+Resolve Type Aliases-             ConvertHIR_ExpandAliases_GetExpansion_GP: ::"anyhow-1_0_40_H2"::Result<(),> -> ::"anyhow-1_0_40_H2"::Result<(),_,> -> ::"core-0_0_0"::result::Result<(),_,>/*?*/
+```
+
+Anyhow's definition: `pub type Result<T, E = Error> = core::result::Result<T, E>;`
+
+Problem: RTA doesn't correctly handle missing/not-complete argument lists

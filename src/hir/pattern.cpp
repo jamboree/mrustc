@@ -43,8 +43,8 @@ namespace HIR {
         return os;
     }
     ::std::ostream& operator<<(::std::ostream& os, const Pattern& x) {
-        if( x.m_binding.is_valid() ) {
-            os << x.m_binding;
+        for(const auto& pb : x.m_bindings) {
+            os << pb;
         }
         if( x.m_implicit_deref_count > 0 ) {
             os << "&*" << x.m_implicit_deref_count;
@@ -108,7 +108,9 @@ namespace HIR {
             os << e.val;
             }
         TU_ARMA(Range, e) {
-            os << e.start << " ... " << e.end;
+            if(e.start) os << *e.start;
+            os << " .." << (e.is_inclusive ? "=" : "") << " ";
+            if(e.end)   os << *e.end;
             }
 
         TU_ARMA(Slice, e) {
@@ -128,6 +130,16 @@ namespace HIR {
             for(const auto& s : e.trailing)
                 os << ", " << s;
             os << " ]";
+            }
+        TU_ARMA(Or, e) {
+            os << "(";
+            for(size_t i = 0; i < e.size(); i ++)
+            {
+                if(i != 0)
+                    os << "|";
+                os << e[i];
+            }
+            os << ")";
             }
         }
         return os;
@@ -233,8 +245,9 @@ namespace { ::HIR::Pattern::Data clone_pattern_data(const ::HIR::Pattern::Data& 
         }
     TU_ARMA(Range, e) {
         return ::HIR::Pattern::Data::make_Range({
-            clone_patval(e.start),
-            clone_patval(e.end)
+            box$(clone_patval(*e.start)),
+            box$(clone_patval(*e.end)),
+            e.is_inclusive
             });
         }
 
@@ -250,13 +263,15 @@ namespace { ::HIR::Pattern::Data clone_pattern_data(const ::HIR::Pattern::Data& 
             clone_pat_vec(e.trailing)
             });
         }
+    TU_ARMA(Or, e)
+        return clone_pat_vec(e);
     }
 
     throw "";
 } }
 ::HIR::Pattern HIR::Pattern::clone() const
 {
-    auto rv = Pattern(m_binding, clone_pattern_data(m_data));
+    auto rv = Pattern(m_bindings, clone_pattern_data(m_data));
     rv.m_implicit_deref_count = m_implicit_deref_count;
     return rv;
 }

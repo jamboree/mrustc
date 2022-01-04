@@ -20,7 +20,7 @@ class CExpander_assert:
     {
         Token   tok;
 
-        auto lex = TTStream(sp, ParseState(crate.m_edition), tt);
+        auto lex = TTStream(sp, ParseState(), tt);
         lex.parse_state().module = &mod;
 
         // assertion condition
@@ -33,6 +33,9 @@ class CExpander_assert:
         toks.push_back( Token(TOK_EXCLAM) );
 
         GET_TOK(tok, lex);
+        if( tok == TOK_COMMA && lex.lookahead(0) == TOK_EOF ) {
+            GET_TOK(tok, lex);
+        }
         if( tok == TOK_COMMA )
         {
             toks.push_back( Token(InterpolatedFragment(InterpolatedFragment::EXPR, n.release())) );
@@ -41,23 +44,39 @@ class CExpander_assert:
             toks.push_back( Token(TOK_IDENT, RcString::new_interned("panic")) );
             toks.push_back( Token(TOK_EXCLAM) );
             toks.push_back( Token(TOK_PAREN_OPEN) );
-            while(lex.lookahead(0) != TOK_EOF )
+
+            auto fmt = Parse_Expr0(lex);
+            // If there's a comma, it's a formatting sequence
+            if( lex.getTokenIf(TOK_COMMA) )
             {
-                if( lex.lookahead(0) == TOK_IDENT && lex.lookahead(1) == TOK_EQUAL )
+                toks.push_back( Token(InterpolatedFragment(InterpolatedFragment::EXPR, fmt.release())) );
+
+                while(lex.lookahead(0) != TOK_EOF )
                 {
-                    toks.push_back( lex.getToken() );
-                    toks.push_back( lex.getToken() );
-                    toks.push_back( Token(InterpolatedFragment(InterpolatedFragment::EXPR, Parse_Expr0(lex).release())) );
+                    toks.push_back(TOK_COMMA);
+
+                    if( (lex.lookahead(0) == TOK_IDENT || Token::type_is_rword(lex.lookahead(0))) && lex.lookahead(1) == TOK_EQUAL )
+                    {
+                        toks.push_back( lex.getToken() );
+                        toks.push_back( lex.getToken() );
+                        toks.push_back( Token(InterpolatedFragment(InterpolatedFragment::EXPR, Parse_Expr0(lex).release())) );
+                    }
+                    else
+                    {
+                        toks.push_back( Token(InterpolatedFragment(InterpolatedFragment::EXPR, Parse_Expr0(lex).release())) );
+                    }
+                    if( lex.lookahead(0) != TOK_COMMA )
+                        break;
+                    GET_CHECK_TOK(tok, lex, TOK_COMMA);
                 }
-                else
-                {
-                    toks.push_back( Token(InterpolatedFragment(InterpolatedFragment::EXPR, Parse_Expr0(lex).release())) );
-                }
-                if( lex.lookahead(0) != TOK_COMMA )
-                    break;
-                GET_CHECK_TOK(tok, lex, TOK_COMMA);
-                toks.push_back( Token(TOK_COMMA) );
             }
+            else
+            {   // Single-argument: Treat as a `Display`-able value
+                toks.push_back( Token(TOK_STRING, std::string("{}")) );
+                toks.push_back(TOK_COMMA);
+                toks.push_back( Token(InterpolatedFragment(InterpolatedFragment::EXPR, fmt.release())) );
+            }
+
             GET_CHECK_TOK(tok, lex, TOK_EOF);
             toks.push_back( Token(TOK_PAREN_CLOSE) );
         }
@@ -84,7 +103,7 @@ class CExpander_assert:
 
         toks.push_back( Token(TOK_BRACE_CLOSE) );
 
-        return box$( TTStreamO(sp, ParseState(crate.m_edition), TokenTree(Ident::Hygiene::new_scope(), mv$(toks))) );
+        return box$( TTStreamO(sp, ParseState(), TokenTree(AST::Edition::Rust2015, Ident::Hygiene::new_scope(), mv$(toks))) );
     }
 };
 

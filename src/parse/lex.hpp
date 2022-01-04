@@ -39,17 +39,20 @@ class Lexer:
     unsigned int m_line;
     unsigned int m_line_ofs;
 
-    ::std::ifstream m_istream;
+    ::std::unique_ptr<::std::ifstream>  m_istream_fp;
+    ::std::istream& m_istream;
     bool    m_last_char_valid;
     Codepoint   m_last_char;
     ::std::vector<Token>    m_next_tokens;
 
+    AST::Edition    m_edition;
     Ident::Hygiene m_hygiene;
 public:
-    Lexer(const ::std::string& filename, ParseState ps);
+    Lexer(const ::std::string& filename, AST::Edition edition, ParseState ps);
 
     Position getPosition() const override;
     Ident::Hygiene realGetHygiene() const override;
+    AST::Edition realGetEdition() const override { return m_edition; }
     Token realGetToken() override;
 
 private:
@@ -66,7 +69,7 @@ private:
         DEBUG(">> " << m_hygiene);
     }
     void pop_hygine() override {
-        DEBUG("<< " << m_hygiene);
+        DEBUG("<< " << m_hygiene << " -> " << m_hygiene.get_parent());
         m_hygiene = m_hygiene.get_parent();
     }
 

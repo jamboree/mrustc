@@ -56,6 +56,8 @@ public:
     bool is_valid() const { return m_name.name != ""; }
 };
 
+struct StructPatternEntry;
+
 class Pattern
 {
 public:
@@ -87,15 +89,17 @@ public:
         (Box,       struct { unique_ptr<Pattern> sub; } ),
         (Ref,       struct { bool mut; unique_ptr<Pattern> sub; } ),
         (Value,     struct { Value start; Value end; } ),
+        (ValueLeftInc, struct { Value start; Value end; } ),
         (Tuple,     TuplePat ),
         (StructTuple, struct { Path path; TuplePat tup_pat; } ),
-        (Struct,    struct { Path path; ::std::vector< ::std::pair< RcString, Pattern> > sub_patterns; bool is_exhaustive; } ),
+        (Struct,    struct { Path path; ::std::vector<StructPatternEntry> sub_patterns; bool is_exhaustive; } ),
         (Slice,     struct { ::std::vector<Pattern> sub_pats; }),
-        (SplitSlice, struct { ::std::vector<Pattern> leading; PatternBinding extra_bind; ::std::vector<Pattern> trailing; } )
+        (SplitSlice, struct { ::std::vector<Pattern> leading; PatternBinding extra_bind; ::std::vector<Pattern> trailing; } ),
+        (Or,        std::vector<Pattern>)
         );
 private:
     Span    m_span;
-    PatternBinding  m_binding;
+    std::vector<PatternBinding> m_bindings;
     Data m_data;
 
 public:
@@ -125,9 +129,10 @@ public:
 
     struct TagBind {};
     Pattern(TagBind, Span sp, Ident name, PatternBinding::Type ty = PatternBinding::Type::MOVE, bool is_mut=false):
-        m_span( mv$(sp) ),
-        m_binding( PatternBinding(mv$(name), ty, is_mut) )
-    {}
+        m_span( mv$(sp) )
+    {
+        m_bindings.push_back( PatternBinding(mv$(name), ty, is_mut) );
+    }
 
     struct TagBox {};
     Pattern(TagBox, Span sp, Pattern sub):
@@ -172,15 +177,10 @@ public:
     {}
 
     struct TagStruct {};
-    Pattern(TagStruct, Span sp, Path path, ::std::vector< ::std::pair< RcString,Pattern> > sub_patterns, bool is_exhaustive):
+    Pattern(TagStruct, Span sp, Path path, ::std::vector<StructPatternEntry> sub_patterns, bool is_exhaustive):
         m_span( mv$(sp) ),
         m_data( Data::make_Struct( { ::std::move(path), ::std::move(sub_patterns), is_exhaustive } ) )
     {}
-
-    // Mutators
-    void set_bind(Ident name, PatternBinding::Type type, bool is_mut) {
-        m_binding = PatternBinding(mv$(name), type, is_mut);
-    }
 
 
     const Span& span() const { return m_span; }
@@ -188,14 +188,21 @@ public:
     Pattern clone() const;
 
     // Accessors
-          PatternBinding& binding()       { return m_binding; }
-    const PatternBinding& binding() const { return m_binding; }
+          std::vector<PatternBinding>& bindings()       { return m_bindings; }
+    const std::vector<PatternBinding>& bindings() const { return m_bindings; }
           Data& data()       { return m_data; }
     const Data& data() const { return m_data; }
           Path& path()       { return m_data.as_StructTuple().path; }
     const Path& path() const { return m_data.as_StructTuple().path; }
 
     friend ::std::ostream& operator<<(::std::ostream& os, const Pattern& pat);
+};
+
+struct StructPatternEntry
+{
+    AttributeList   attrs;
+    RcString    name;
+    Pattern     pat;
 };
 
 extern ::std::ostream& operator<<(::std::ostream& os, const Pattern::Value& val);

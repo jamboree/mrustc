@@ -136,7 +136,7 @@ public:
     }
     void write_string(const RcString& v);
     void write_string(size_t len, const char* s) {
-        //DEBUG(FMT_CB(os, for(size_t i = 0; i < ));
+        TRACE_FUNCTION;
         if(len < 128) {
             write_u8( static_cast<uint8_t>(len) );
         }
@@ -151,6 +151,7 @@ public:
         write_string(v.size(), v.c_str());
     }
     void write_bool(bool v) {
+        TRACE_FUNCTION_F(v);
         write_u8(v ? 0xFF : 0x00);
     }
 
@@ -192,7 +193,7 @@ public:
         CloseOnDrop(Writer& r): r(&r) {}
     public:
         CloseOnDrop(CloseOnDrop&& x): r(x.r) { x.r = nullptr; }
-        ~CloseOnDrop(){ if(r) r->close_object(); }
+        ~CloseOnDrop(){ if(r) r->close_object(); r = nullptr; }
     };
     CloseOnDrop open_object(const char* name) {
         write_u8(0xFD);
@@ -340,7 +341,7 @@ public:
         else /*if( v == 0xFF )*/ {
             rv = ~0u;
         }
-        //DEBUG(rv);
+        DEBUG(rv);
         return rv;
     }
     RcString read_istring() {
@@ -360,7 +361,15 @@ public:
         return rv;
     }
     bool read_bool() {
-        return read_u8() != 0x00;
+        auto v = read_u8();
+        switch(v)
+        {
+        case 0: return false;
+        case 255: return true;
+        default:
+            std::cerr << "Expected false(0)/true(255), got " << unsigned(v) << "u8" << ::std::endl;
+            abort();
+        }
     }
 
 
@@ -411,14 +420,15 @@ public:
         Reader* r;
         CloseOnDrop(Reader& r): r(&r) {}
     public:
+        CloseOnDrop(const CloseOnDrop&) = delete;
         CloseOnDrop(CloseOnDrop&& x): r(x.r) { x.r = nullptr; }
-        ~CloseOnDrop(){ if(r) r->close_object(); }
+        ~CloseOnDrop(){ if(r) r->close_object(); r = nullptr; }
     };
 
     CloseOnDrop open_object(const char* name) {
         auto v = read_u8();
         if( v != 0xFD ) {
-            std::cerr << "Expected OpenNamed(" << name << "), got " << unsigned(v) << ::std::endl;
+            std::cerr << "Expected OpenNamed(" << name << "), got " << unsigned(v) << "u8" << ::std::endl;
             abort();
         }
         auto key = raw_read_uint();
@@ -443,7 +453,11 @@ public:
         return CloseOnDrop(*this);
     }
     void close_object() {
-        assert(read_u8() == 0xFF);
+        auto v = read_u8();
+        if( v != 0xFF ) {
+            std::cerr << "Expected CloseObject(0xFF), got " << unsigned(v) << ::std::endl;
+            abort();
+        }
     }
 };
 

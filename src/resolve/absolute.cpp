@@ -79,9 +79,14 @@ namespace
         const ::AST::Crate&     m_crate;
         const ::AST::Module&    m_mod;
         ::std::vector<Ent>  m_name_context;
+        struct PatternStackEnt {
+            unsigned    first_arm_done = false;
+            std::set<Ident> created_variables;
+            std::set<Ident> first_arm_variables;
+        };
+        ::std::vector<PatternStackEnt>    m_pattern_stack;
         unsigned int m_var_count;
         unsigned int m_block_level;
-        bool m_frozen_bind_set;
 
         // Destination `GenericParams` for in_band_lifetimes
         ::AST::GenericParams* m_ibl_target_generics;
@@ -91,7 +96,6 @@ namespace
             m_mod(mod),
             m_var_count(~0u),
             m_block_level(0),
-            m_frozen_bind_set( false ),
             m_ibl_target_generics(nullptr)
         {}
 
@@ -238,8 +242,20 @@ namespace
             if( m_var_count == ~0u ) {
                 BUG(sp, "Assigning local when there's no variable context");
             }
-            // TODO: Handle avoiding duplicate bindings in a pattern
-            if( m_frozen_bind_set )
+            // If this variable is defined within a stack entry, then use it
+            assert(!m_pattern_stack.empty());
+            bool already_defined = m_pattern_stack.back().first_arm_done;
+            for(auto it = m_pattern_stack.rbegin(); it != m_pattern_stack.rend(); ++it) {
+                if( it->first_arm_variables.count(name) ) {
+                    already_defined = true;
+                    break;
+                }
+            }
+            if( !m_pattern_stack.back().created_variables.insert(name).second ) {
+                ERROR(sp, E0000, "Duplicate definition of `" << name << "` in pattern arm");
+            }
+            // Are we currently in the second (or later) arm of a split pattern
+            if( already_defined )
             {
                 if( !m_name_context.back().is_VarBlock() ) {
                     BUG(sp, "resolve/absolute.cpp - Context::push_var - No block");
@@ -247,12 +263,12 @@ namespace
                 auto& vb = m_name_context.back().as_VarBlock();
                 for( const auto& v : vb.variables )
                 {
-                    // TODO: Error when a binding is used twice or not at all
                     if( v.first == name ) {
+                        DEBUG("Arm defined var @ " << m_block_level << ": #" << v.second << " " << name);
                         return v.second;
                     }
                 }
-                ERROR(sp, E0000, "Mismatched bindings in pattern");
+                ERROR(sp, E0000, "Mismatched bindings in pattern (`" << name << "` wasn't in the first arm)");
             }
             else
             {
@@ -293,16 +309,36 @@ namespace
         /// Indicate that a multiple-pattern binding is started
         void start_patbind() {
             assert( m_block_level > 0 );
-            m_name_context.push_back( Ent::make_VarBlock({ m_block_level, {} }) );
-            assert( m_frozen_bind_set == false );
+            m_pattern_stack.push_back(PatternStackEnt());
         }
         /// Freeze the set of pattern bindings
-        void freeze_patbind() {
-            m_frozen_bind_set = true;
+        void end_patbind_arm(const Span& sp) {
+            auto& e = m_pattern_stack.back();
+            if(e.first_arm_done)
+            {
+                if( e.first_arm_variables != e.created_variables ) {
+                    ERROR(sp, E0000, "Mismatched bindings in pattern - [" << e.first_arm_variables << "] != [" << e.created_variables << "]");
+                }
+            }
+            else
+            {
+                e.first_arm_variables = std::move(e.created_variables);
+                e.first_arm_done = true;
+            }
+            e.created_variables.clear();
         }
         /// End a multiple-pattern binding state (unfreeze really)
         void end_patbind() {
-            m_frozen_bind_set = false;
+            assert(!m_pattern_stack.empty());
+            // Propagate the created variables to the next level up.
+            if( m_pattern_stack.size() > 1 ) {
+                const auto& cur = m_pattern_stack[m_pattern_stack.size() - 1];
+                auto& next = m_pattern_stack[m_pattern_stack.size() - 2];
+                for(auto& var : cur.first_arm_variables) {
+                    next.created_variables.insert(std::move(var));
+                }
+            }
+            m_pattern_stack.pop_back();
         }
 
 
@@ -712,9 +748,11 @@ namespace
                     }
                 TU_ARMA(VarBlock, e) {
                     if( mode == LookupMode::Variable ) {
+                        DEBUG("- VarBlock lvl" << e.level);
                         for( auto it2 = e.variables.rbegin(); it2 != e.variables.rend(); ++ it2 )
                         {
                             // TODO: Hyginic lookup?
+                            DEBUG(" > " << it2->first.name);
                             if( it2->first.name == name ) {
                                 return it2->second;
                             }
@@ -722,6 +760,7 @@ namespace
                     }
                     }
                 TU_ARMA(Generic, e) {
+                    DEBUG("- Generic");
                     switch(mode)
                     {
                     case LookupMode::Type:
@@ -805,7 +844,38 @@ void Resolve_Absolute_PathParams(/*const*/ Context& context, const Span& sp, ::A
             Resolve_Absolute_Lifetime(context, sp, l);
             }
         TU_ARMA(Type, t) {
-            Resolve_Absolute_Type(context, t);
+            // A trivial path type might be refering to a generic value (e.g. `Foo<T,N>` where `N` is a const generic)
+            if(t.m_data.is_Path() && t.m_data.as_Path()->is_trivial() )
+            {
+                auto p = t.m_data.as_Path()->m_class.as_Relative();
+                // If type lookup fails
+                auto new_path = context.lookup_opt(p.nodes[0].name(), p.hygiene, Context::LookupMode::Type);
+                if(new_path == AST::Path()) {
+                    // Try (constant) value lookup
+                    auto new_path = context.lookup_opt(p.nodes[0].name(), p.hygiene, Context::LookupMode::Constant);
+                    if(new_path != AST::Path()) {
+                        // If that lookup succeeds, then create a value (and visit it - just in case)
+                        ent = AST::PathParamEnt::make_Value(new AST::ExprNode_NamedValue(std::move(new_path)));
+                        Resolve_Absolute_ExprNode(context, *ent.as_Value());
+                    }
+                    else {
+                        // Otherwise, visit (which will most likely fail)
+                        Resolve_Absolute_Type(context, t);
+                    }
+                }
+                else {
+                    // Normal type, update it then visit
+                    *t.m_data.as_Path() = std::move(new_path);
+                    Resolve_Absolute_Type(context, t);
+                }
+            }
+            else
+            {
+                Resolve_Absolute_Type(context, t);
+            }
+            }
+        TU_ARMA(Value, n) {
+            Resolve_Absolute_ExprNode(context, *n);
             }
         TU_ARMA(AssociatedTyEqual, a) {
             Resolve_Absolute_Type(context, a.second);
@@ -1058,6 +1128,9 @@ namespace {
             TU_ARMA(Trait, e) {
                 pbt = ::AST::PathBinding_Type::make_Trait({nullptr, &e});
                 }
+            TU_ARMA(TraitAlias, e) {
+                pbt = ::AST::PathBinding_Type::make_TraitAlias({nullptr, &e});
+                }
             TU_ARMA(TypeAlias, e) {
                 pbt = ::AST::PathBinding_Type::make_TypeAlias({nullptr/*, &e*/});
                 }
@@ -1136,6 +1209,12 @@ namespace {
             TU_ARMA(Module, e) {
                 hmod = &e;
                 }
+            TU_ARMA(TraitAlias, e) {
+                //for(const auto& trait_path_hir : e.m_traits)
+                //{
+                //}
+                TODO(sp, "Path referring to a trait alias - " << path);
+                }
             TU_ARMA(Trait, e) {
                 AST::AbsolutePath   ap( crate.m_name, {} );
                 for(unsigned int j = start; j <= i; j ++)
@@ -1193,7 +1272,7 @@ namespace {
             TU_ARMA(Enum, e) {
                 if( i+1 < path_abs.nodes.size() )
                 {
-                    const auto& next_node = path_abs.nodes[i+1];
+                    auto& next_node = path_abs.nodes[i+1];
                     // If this refers to an enum variant, return the full path
                     // - Otherwise, assume it's an associated type?
                     auto idx = e.find_variant(next_node.name());
@@ -1210,7 +1289,13 @@ namespace {
 
                         // NOTE: Type parameters for enums go after the _variant_
                         if( ! n.args().is_empty() ) {
-                            ERROR(sp, E0000, "Type parameters were not expected here (enum params go on the variant)");
+                            if( next_node.args().is_empty() ) {
+                                DEBUG("Moving type params from on the enum to the variant");
+                                next_node.args() = std::move(n.args());
+                            }
+                            else {
+                                ERROR(sp, E0000, "Type parameters were not expected here (enum params go on the variant)");
+                            }
                         }
 
                         if( e.m_data.is_Data() && e.m_data.as_Data()[idx].is_struct ) {
@@ -1254,6 +1339,9 @@ namespace {
                         }
                     TU_ARMA(Trait, e) {
                         pbt = ::AST::PathBinding_Type::make_Trait({nullptr, &e});
+                        }
+                    TU_ARMA(TraitAlias, e) {
+                        pbt = ::AST::PathBinding_Type::make_TraitAlias({nullptr, &e});
                         }
                     TU_ARMA(Module, e) {
                         pbt = ::AST::PathBinding_Type::make_Module({nullptr, {&crate, &e}});
@@ -1358,7 +1446,7 @@ void Resolve_Absolute_Path_BindAbsolute(Context& context, const Span& sp, Contex
     TRACE_FUNCTION_FR("path = " << path, path);
     auto& path_abs = path.m_class.as_Absolute();
 
-    if( path_abs.crate != "" ) {
+    if( path_abs.crate != "" && path_abs.crate != context.m_crate.m_crate_name_real ) {
         // TODO: Handle items from other crates (back-converting HIR paths)
         Resolve_Absolute_Path_BindAbsolute__hir_from(context, sp, mode, path,  context.m_crate.m_extern_crates.at(path_abs.crate), 0);
         return ;
@@ -1499,7 +1587,7 @@ void Resolve_Absolute_Path_BindAbsolute(Context& context, const Span& sp, Contex
                 }
                 else {
                     assert( e.enum_ );
-                    const auto& last_node = path_abs.nodes.back();
+                    auto& last_node = path_abs.nodes.back();
                     for( const auto& var : e.enum_->variants() ) {
                         if( var.m_name == last_node.name() ) {
 
@@ -1508,7 +1596,13 @@ void Resolve_Absolute_Path_BindAbsolute(Context& context, const Span& sp, Contex
                             }
                             // NOTE: Type parameters for enums go after the _variant_
                             if( ! n.args().is_empty() ) {
-                                ERROR(sp, E0000, "Type parameters were not expected here (enum params go on the variant)");
+                                if( last_node.args().is_empty() ) {
+                                    DEBUG("Moving type params from on the enum to the variant");
+                                    last_node.args() = std::move(n.args());
+                                }
+                                else {
+                                    ERROR(sp, E0000, "Type parameters were not expected here (enum params go on the variant)");
+                                }
                             }
 
                             unsigned int idx = &var - &e.enum_->variants().front();
@@ -2033,6 +2127,11 @@ void Resolve_Absolute_Type(Context& context,  TypeRef& type)
             Resolve_Absolute_Path(context, type.span(), Context::LookupMode::Type, *trait.path);
             context.pop(trait.hrbs);
         }
+        for(auto& trait : e.maybe_traits) {
+            context.push( trait.hrbs );
+            Resolve_Absolute_Path(context, type.span(), Context::LookupMode::Type, *trait.path);
+            context.pop(trait.hrbs);
+        }
         for(auto& lft : e.lifetimes)
             Resolve_Absolute_Lifetime(context, type.span(), lft);
         }
@@ -2083,22 +2182,18 @@ void Resolve_Absolute_ExprNode(Context& context,  ::AST::ExprNode& node)
             for( auto& arm : node.m_arms )
             {
                 this->context.push_block();
-                if( arm.m_patterns.size() > 1 ) {
-                    // TODO: Save the context, ensure that each arm results in the same state.
-                    // - Or just an equivalent state
-                    // OR! Have a mode in the context that handles multiple bindings.
-                    this->context.start_patbind();
-                    for( auto& pat : arm.m_patterns )
-                    {
-                        Resolve_Absolute_Pattern(this->context, true,  pat);
-                        this->context.freeze_patbind();
-                    }
-                    this->context.end_patbind();
-                    // Requires ensuring that the binding set is the same.
+
+                this->context.start_patbind();
+                // TODO: Save the context, ensure that each arm results in the same state.
+                // - Or just an equivalent state
+                // OR! Have a mode in the context that handles multiple bindings.
+                for( auto& pat : arm.m_patterns )
+                {
+                    // If this isn't the first pattern, save the newly created bindings, roll back entire state, and check afterwards
+                    Resolve_Absolute_Pattern(this->context, true,  pat);
+                    this->context.end_patbind_arm(pat.span());
                 }
-                else {
-                    Resolve_Absolute_Pattern(this->context, true,  arm.m_patterns[0]);
-                }
+                this->context.end_patbind();
 
                 if(arm.m_cond)
                     arm.m_cond->visit( *this );
@@ -2118,7 +2213,9 @@ void Resolve_Absolute_ExprNode(Context& context,  ::AST::ExprNode& node)
             case ::AST::ExprNode_Loop::WHILE:
                 break;
             case ::AST::ExprNode_Loop::WHILELET:
+                this->context.start_patbind();
                 Resolve_Absolute_Pattern(this->context, true, node.m_pattern);
+                this->context.end_patbind();
                 break;
             case ::AST::ExprNode_Loop::FOR:
                 BUG(node.span(), "`for` should be desugared");
@@ -2131,7 +2228,9 @@ void Resolve_Absolute_ExprNode(Context& context,  ::AST::ExprNode& node)
             DEBUG("ExprNode_LetBinding");
             Resolve_Absolute_Type(this->context, node.m_type);
             AST::NodeVisitorDef::visit(node);
+            this->context.start_patbind();
             Resolve_Absolute_Pattern(this->context, false, node.m_pat);
+            this->context.end_patbind();
         }
         void visit(AST::ExprNode_IfLet& node) override {
             DEBUG("ExprNode_IfLet");
@@ -2143,7 +2242,7 @@ void Resolve_Absolute_ExprNode(Context& context,  ::AST::ExprNode& node)
             for(auto& pat : node.m_patterns)
             {
                 Resolve_Absolute_Pattern(this->context, true, pat);
-                this->context.freeze_patbind();
+                this->context.end_patbind_arm(pat.span());
             }
             this->context.end_patbind();
 
@@ -2191,7 +2290,9 @@ void Resolve_Absolute_ExprNode(Context& context,  ::AST::ExprNode& node)
             this->context.push_block();
             for( auto& arg : node.m_args ) {
                 Resolve_Absolute_Type(this->context,  arg.second);
+                this->context.start_patbind();
                 Resolve_Absolute_Pattern(this->context, false,  arg.first);
+                this->context.end_patbind();
             }
 
             node.m_code->visit(*this);
@@ -2268,51 +2369,43 @@ void Resolve_Absolute_PatternValue(/*const*/ Context& context, const Span& sp, :
 void Resolve_Absolute_Pattern(Context& context, bool allow_refutable,  ::AST::Pattern& pat)
 {
     TRACE_FUNCTION_FR("allow_refutable = " << allow_refutable << ", pat = " << pat, pat);
-    if( pat.binding().is_valid() ) {
-        if( !pat.data().is_Any() && ! allow_refutable )
-            TODO(pat.span(), "Resolve_Absolute_Pattern - Encountered bound destructuring pattern");
-        pat.binding().m_slot = context.push_var( pat.span(), pat.binding().m_name );
-        DEBUG("- Binding #" << pat.binding().m_slot << " '" << pat.binding().m_name << "'");
+    for(auto& pb : pat.bindings()) {
+        //if( !pat.data().is_Any() && ! allow_refutable )
+        //    TODO(pat.span(), "Resolve_Absolute_Pattern - Encountered bound destructuring pattern");
+        pb.m_slot = context.push_var( pat.span(), pb.m_name );
+        DEBUG("- Binding #" << pb.m_slot << " '" << pb.m_name << "'");
     }
 
-    TU_MATCH( ::AST::Pattern::Data, (pat.data()), (e),
-    (MaybeBind,
-        assert( pat.binding().is_valid() == false );
-        if( allow_refutable ) {
-            auto name = mv$( e.name );
-            // Attempt to resolve the name in the current namespace, and if it fails, it's a binding
-            auto p = context.lookup_opt( name.name, name.hygiene, Context::LookupMode::PatternValue );
-            if( p.is_valid() ) {
-                Resolve_Absolute_Path(context, pat.span(), Context::LookupMode::PatternValue, p);
-                pat = ::AST::Pattern(::AST::Pattern::TagValue(), pat.span(), ::AST::Pattern::Value::make_Named(mv$(p)));
-                DEBUG("MaybeBind resolved to " << pat);
-            }
-            else {
-                pat = ::AST::Pattern(::AST::Pattern::TagBind(), pat.span(), mv$(name));
-                pat.binding().m_slot = context.push_var( pat.span(), pat.binding().m_name );
-                DEBUG("- Binding #" << pat.binding().m_slot << " '" << pat.binding().m_name << "' (was MaybeBind)");
-            }
+    TU_MATCH_HDRA( (pat.data()), {)
+    TU_ARMA(MaybeBind, e) {
+        auto name = mv$( e.name );
+        // Attempt to resolve the name in the current namespace, and if it fails, it's a binding
+        auto p = context.lookup_opt( name.name, name.hygiene, Context::LookupMode::PatternValue );
+        if( p.is_valid() ) {
+            Resolve_Absolute_Path(context, pat.span(), Context::LookupMode::PatternValue, p);
+            pat.data() = AST::Pattern::Data::make_Value({ ::AST::Pattern::Value::make_Named(mv$(p)), AST::Pattern::Value() });
+            DEBUG("MaybeBind resolved to " << pat);
         }
         else {
-            auto name = mv$( e.name );
-
-            pat = ::AST::Pattern(::AST::Pattern::TagBind(), pat.span(), mv$(name));
-            pat.binding().m_slot = context.push_var( pat.span(), pat.binding().m_name );
+            pat.bindings().push_back(AST::PatternBinding(mv$(name), AST::PatternBinding::Type::MOVE, false));
+            pat.bindings().back().m_slot = context.push_var( pat.span(), pat.bindings().back().m_name );
+            pat.data() = AST::Pattern::Data::make_Any({});
+            DEBUG("- Binding #" << pat.bindings().back().m_slot << " '" << pat.bindings().back().m_name << "' (was MaybeBind)");
         }
-        ),
-    (Macro,
+        }
+    TU_ARMA(Macro, e) {
         BUG(pat.span(), "Resolve_Absolute_Pattern - Encountered Macro - " << pat);
-        ),
-    (Any,
+        }
+    TU_ARMA(Any, e) {
         // Ignore '_'
-        ),
-    (Box,
+        }
+    TU_ARMA(Box, e) {
         Resolve_Absolute_Pattern(context, allow_refutable,  *e.sub);
-        ),
-    (Ref,
+        }
+    TU_ARMA(Ref, e) {
         Resolve_Absolute_Pattern(context, allow_refutable,  *e.sub);
-        ),
-    (Value,
+        }
+    TU_ARMA(Value, e) {
         if( ! allow_refutable )
         {
             // TODO: If this is a single value of a unit-like struct, accept
@@ -2320,35 +2413,44 @@ void Resolve_Absolute_Pattern(Context& context, bool allow_refutable,  ::AST::Pa
         }
         Resolve_Absolute_PatternValue(context, pat.span(), e.start);
         Resolve_Absolute_PatternValue(context, pat.span(), e.end);
-        ),
-    (Tuple,
+        }
+    TU_ARMA(ValueLeftInc, e) {
+        if( ! allow_refutable )
+        {
+            // TODO: If this is a single value of a unit-like struct, accept
+            BUG(pat.span(), "Resolve_Absolute_Pattern - Encountered refutable pattern where only irrefutable allowed - " << pat);
+        }
+        Resolve_Absolute_PatternValue(context, pat.span(), e.start);
+        Resolve_Absolute_PatternValue(context, pat.span(), e.end);
+        }
+    TU_ARMA(Tuple, e) {
         for(auto& sp : e.start)
             Resolve_Absolute_Pattern(context, allow_refutable,  sp);
         for(auto& sp : e.end)
             Resolve_Absolute_Pattern(context, allow_refutable,  sp);
-        ),
-    (StructTuple,
+        }
+    TU_ARMA(StructTuple, e) {
         Resolve_Absolute_Path(context, pat.span(), Context::LookupMode::Constant, e.path);
         for(auto& sp : e.tup_pat.start)
             Resolve_Absolute_Pattern(context, allow_refutable,  sp);
         for(auto& sp : e.tup_pat.end)
             Resolve_Absolute_Pattern(context, allow_refutable,  sp);
-        ),
-    (Struct,
+        }
+    TU_ARMA(Struct, e) {
         // TODO: `Struct { .. }` patterns can match anything
         //if( e.sub_patterns.empty() && !e.is_exhaustive ) {
         //    auto rv = this->lookup_opt(name, src_context, mode);
         //}
         Resolve_Absolute_Path(context, pat.span(), Context::LookupMode::Type, e.path);
         for(auto& sp : e.sub_patterns)
-            Resolve_Absolute_Pattern(context, allow_refutable,  sp.second);
-        ),
-    (Slice,
+            Resolve_Absolute_Pattern(context, allow_refutable,  sp.pat);
+        }
+    TU_ARMA(Slice, e) {
         // NOTE: Can be irrefutable (if the type is array)
         for(auto& sp : e.sub_pats)
             Resolve_Absolute_Pattern(context, allow_refutable,  sp);
-        ),
-    (SplitSlice,
+        }
+    TU_ARMA(SplitSlice, e) {
         // NOTE: Can be irrefutable (if the type is array)
         for(auto& sp : e.leading)
             Resolve_Absolute_Pattern(context, allow_refutable,  sp);
@@ -2357,8 +2459,17 @@ void Resolve_Absolute_Pattern(Context& context, bool allow_refutable,  ::AST::Pa
         }
         for(auto& sp : e.trailing)
             Resolve_Absolute_Pattern(context, allow_refutable,  sp);
-        )
-    )
+        }
+    TU_ARMA(Or, e) {
+        // TODO: Need to ensure that all arms bind the same set of variables
+        context.start_patbind();
+        for(auto& sp : e) {
+            Resolve_Absolute_Pattern(context, allow_refutable,  sp);
+            context.end_patbind_arm(sp.span());
+        }
+        context.end_patbind();
+        }
+    }
 }
 
 // - For traits
@@ -2380,7 +2491,8 @@ void Resolve_Absolute_ImplItems(Context& item_context,  ::AST::NamedList< ::AST:
         (Module, BUG(i.span, "Resolve_Absolute_ImplItems - Module");),
         (Crate , BUG(i.span, "Resolve_Absolute_ImplItems - Crate");),
         (Enum  , BUG(i.span, "Resolve_Absolute_ImplItems - Enum");),
-        (Trait , BUG(i.span, "Resolve_Absolute_ImplItems - Trait");),
+        (Trait , BUG(i.span, "Resolve_Absolute_ImplItems - " << i.data.tag_str());),
+        (TraitAlias, BUG(i.span, "Resolve_Absolute_ImplItems - " << i.data.tag_str());),
         (Struct, BUG(i.span, "Resolve_Absolute_ImplItems - Struct");),
         (Union , BUG(i.span, "Resolve_Absolute_ImplItems - Union");),
         (Type,
@@ -2400,6 +2512,7 @@ void Resolve_Absolute_ImplItems(Context& item_context,  ::AST::NamedList< ::AST:
         (Static,
             DEBUG("Static - " << i.name);
             Resolve_Absolute_Type( item_context, e.type() );
+            auto _h = item_context.enter_rootblock();
             Resolve_Absolute_Expr( item_context, e.value() );
             )
         )
@@ -2425,6 +2538,7 @@ void Resolve_Absolute_ImplItems(Context& item_context,  ::std::vector< ::AST::Im
         (Crate , BUG(i.sp, "Resolve_Absolute_ImplItems - " << i.data->tag_str());),
         (Enum  , BUG(i.sp, "Resolve_Absolute_ImplItems - " << i.data->tag_str());),
         (Trait , BUG(i.sp, "Resolve_Absolute_ImplItems - " << i.data->tag_str());),
+        (TraitAlias, BUG(i.sp, "Resolve_Absolute_ImplItems - " << i.data->tag_str());),
         (Struct, BUG(i.sp, "Resolve_Absolute_ImplItems - " << i.data->tag_str());),
         (Union , BUG(i.sp, "Resolve_Absolute_ImplItems - " << i.data->tag_str());),
         (Type,
@@ -2444,6 +2558,7 @@ void Resolve_Absolute_ImplItems(Context& item_context,  ::std::vector< ::AST::Im
         (Static,
             DEBUG("Static - " << i.name);
             Resolve_Absolute_Type( item_context, e.type() );
+            auto _h = item_context.enter_rootblock();
             Resolve_Absolute_Expr( item_context, e.value() );
             )
         )
@@ -2461,7 +2576,7 @@ void Resolve_Absolute_Function(Context& item_context, ::AST::Function& fcn)
     DEBUG("- Prototype types");
     Resolve_Absolute_Type( item_context, fcn.rettype() );
     for(auto& arg : fcn.args())
-        Resolve_Absolute_Type( item_context, arg.second );
+        Resolve_Absolute_Type( item_context, arg.ty );
     item_context.m_ibl_target_generics = nullptr;
 
     DEBUG("- Body");
@@ -2469,7 +2584,9 @@ void Resolve_Absolute_Function(Context& item_context, ::AST::Function& fcn)
         auto _h = item_context.enter_rootblock();
         item_context.push_block();
         for(auto& arg : fcn.args()) {
-            Resolve_Absolute_Pattern( item_context, false, arg.first );
+            item_context.start_patbind();
+            Resolve_Absolute_Pattern( item_context, false, arg.pat );
+            item_context.end_patbind();
         }
 
         Resolve_Absolute_Expr( item_context, fcn.code() );
@@ -2682,6 +2799,19 @@ void Resolve_Absolute_Mod( Context item_context, ::AST::Module& mod )
         TU_ARMA(Trait, e) {
             DEBUG("Trait - " << i->name);
             Resolve_Absolute_Trait(item_context, e);
+            }
+        TU_ARMA(TraitAlias, e) {
+            DEBUG("TraitAlias - " << i->name);
+            item_context.push( e.params, GenericSlot::Level::Top, true );
+            Resolve_Absolute_Generic(item_context,  e.params);
+
+            for(auto& st : e.traits) {
+                item_context.push(st.ent.hrbs);
+                Resolve_Absolute_Path(item_context, st.sp, Context::LookupMode::Type,  *st.ent.path);
+                item_context.pop(st.ent.hrbs);
+            }
+
+            item_context.pop(e.params, true);
             }
         TU_ARMA(Type, e) {
             DEBUG("Type - " << i->name);

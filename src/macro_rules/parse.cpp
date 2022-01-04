@@ -116,14 +116,21 @@ public:
         case TOK_DOLLAR:
             switch( GET_TOK(tok, lex) )
             {
+            case TOK_SQUARE_CLOSE:
+            case TOK_PAREN_CLOSE:
+            case TOK_BRACE_CLOSE:
+                ret.push_back( MacroPatEnt(lex.end_span(ps), TOK_DOLLAR) );
+                PUTBACK(tok, lex);
+                break;
             case TOK_RWORD_CRATE:   // Not valid, as `$crate` already has meaning
                 throw ParseError::Unexpected(lex, tok);
             default:
                 // NOTE: Allow any reserved word
                 if( !Token::type_is_rword(tok.type()) )
                     throw ParseError::Unexpected(lex, tok);
+            case TOK_UNDERSCORE:
             case TOK_IDENT: {
-                auto name = tok.type() == TOK_IDENT ? tok.ident().name : RcString::new_interned(tok.to_str());
+                auto name = tok.type() == TOK_IDENT ? tok.ident().name : (tok.type() == TOK_UNDERSCORE ? RcString() : RcString::new_interned(tok.to_str()));
                 GET_CHECK_TOK(tok, lex, TOK_COLON);
                 GET_CHECK_TOK(tok, lex, TOK_IDENT);
                 RcString type = tok.ident().name;
@@ -136,7 +143,9 @@ public:
                     ;
                 else if( type == "tt" )
                     ty = MacroPatEnt::PAT_TT;
-                else if( type == "pat" )
+                else if( type == "pat" )    // 
+                    ty = MacroPatEnt::PAT_PAT;
+                else if( type == "pat_param" )  // Added between 39 and 54, explicitly excludes or-patterns
                     ty = MacroPatEnt::PAT_PAT;
                 else if( type == "ident" )
                     ty = MacroPatEnt::PAT_IDENT;
@@ -173,7 +182,7 @@ public:
 
                 GET_TOK(tok, lex);  // Joiner or loop type
                 // If the token is a loop type, then it can't be a joiner
-                if( lex.parse_state().edition_after(AST::Edition::Rust2018) && tok.type() == TOK_QMARK )
+                if( lex.edition_after(AST::Edition::Rust2018) && tok.type() == TOK_QMARK )
                 {
                     // 2018 added `?` repetition operator
                 }
@@ -201,7 +210,7 @@ public:
                     // TODO: Can a `$()?` have a joiner?
                     break;
                 default:
-                    if( lex.parse_state().edition_after(AST::Edition::Rust2018) )
+                    if( lex.edition_after(AST::Edition::Rust2018) )
                         throw ParseError::Unexpected(lex, tok, { TOK_PLUS, TOK_STAR, TOK_QMARK });
                     else
                         throw ParseError::Unexpected(lex, tok, { TOK_PLUS, TOK_STAR });
@@ -297,7 +306,7 @@ struct ContentLoopVariableUse
 
                 GET_TOK(tok, lex);
                 enum eTokenType joiner = TOK_NULL;
-                if( lex.parse_state().edition_after(AST::Edition::Rust2018) && tok.type() == TOK_QMARK )
+                if( lex.edition_after(AST::Edition::Rust2018) && tok.type() == TOK_QMARK )
                 {
                     // 2018 added `?` repetition operator
                 }
@@ -318,7 +327,7 @@ struct ContentLoopVariableUse
                 case TOK_STAR:  loop_type = '*';    break;
                 case TOK_QMARK: loop_type = '?';    break;
                 default:
-                    if( lex.parse_state().edition_after(AST::Edition::Rust2018) )
+                    if( lex.edition_after(AST::Edition::Rust2018) )
                         throw ParseError::Unexpected(lex, tok, { TOK_PLUS, TOK_STAR, TOK_QMARK });
                     else
                         throw ParseError::Unexpected(lex, tok, { TOK_PLUS, TOK_STAR });
@@ -353,9 +362,9 @@ struct ContentLoopVariableUse
                     continue;
                 }
                 // TODO: Check that +/*/? matches for the controlling loops
-                for(const auto& loop_idx : controlling_loops)
-                {
-                }
+                //for(const auto& loop_idx : controlling_loops)
+                //{
+                //}
 
                 if( var_usage_ptr )
                 {
@@ -405,6 +414,11 @@ struct ContentLoopVariableUse
                     }
                     ret.push_back( MacroExpansionEnt(ns->idx) );
                 }
+            }
+            else if( tok.type() == TOK_PAREN_CLOSE || tok.type() == TOK_SQUARE_CLOSE || tok.type() == TOK_BRACE_CLOSE )
+            {
+                PUTBACK(tok, lex);
+                ret.push_back( MacroExpansionEnt(Token(TOK_DOLLAR)) );
             }
             else
             {
@@ -503,7 +517,9 @@ MacroRulesPtr Parse_MacroRules(TokenStream& lex)
     while( lex.lookahead(0) != TOK_EOF && lex.lookahead(0) != TOK_BRACE_CLOSE )
     {
         rules.push_back( Parse_MacroRules_Var(lex) );
-        if(GET_TOK(tok, lex) != TOK_SEMICOLON) {
+        GET_TOK(tok, lex);
+        // LAZY: `macro` allows comma (not `macro_rules!`) but this is strictly more permissive than rustc
+        if(tok.type() != TOK_SEMICOLON && tok.type() != TOK_COMMA ) {
             PUTBACK(tok,lex);
             break;
         }
@@ -560,6 +576,15 @@ namespace {
         return os;
     }
 
+    enum class PatternHeadRv {
+        /// An item has been added to the output
+        Closed,
+        /// Nothing was found (i.e. ran out of data)
+        NotFound,
+        /// The path didn't match
+        InvalidPath,
+    };
+
     // Yields all possible ExpectTok/ExpectPat entries from a pattern position
     // Returns `true` if there's no fall-through
     /// rv: Output vector for tokens
@@ -567,7 +592,7 @@ namespace {
     /// direct_pos: Position in `pattern` at which to start the search
     /// indirect_path: Token/check path to follow before returning an item
     /// indirect_ofs: Current offset into `indirect_path`
-    bool macro_pattern_get_head_set_inner(
+    PatternHeadRv macro_pattern_get_head_set_inner(
         ::std::vector<ExpTok>& rv, const ::std::vector<MacroPatEnt>& pattern, size_t direct_pos,
         const std::vector<ExpTok>& indirect_path, size_t indirect_ofs
         )
@@ -575,33 +600,41 @@ namespace {
         for(size_t idx = direct_pos; idx < pattern.size(); idx ++)
         {
             const auto& ent = pattern[idx];
+            DEBUG(idx << " " << ent);
             switch(ent.type)
             {
             case MacroPatEnt::PAT_LOOP:
-                if( macro_pattern_get_head_set_inner(rv, ent.subpats, 0, indirect_path, indirect_ofs) )
+                switch( macro_pattern_get_head_set_inner(rv, ent.subpats, 0, indirect_path, indirect_ofs) )
                 {
+                case PatternHeadRv::InvalidPath:
+                    if(ent.name == "+")
+                    {
+                        return PatternHeadRv::InvalidPath;
+                    }
+                    else
+                    {
+                        // The path didn't match going into the loop, so consider the next token.
+                    }
+                    break;
+                case PatternHeadRv::Closed:
                     // + loops have to iterate at least once, so if the set is closed by the sub-patterns, close us too
                     if(ent.name == "+")
                     {
-                        return true;
+                        return PatternHeadRv::Closed;
                     }
                     else if( ent.name == "*" || ent.name == "?" )
                     {
                         // for * and ? loops, they can be skipped entirely.
-                        // - No separator, this is for the skip case
+                        // - Don't add the separator, this arm is to capture the case where the arm isn't taken.
                     }
                     else
                     {
                         BUG(Span(), "Unknown loop type " << ent.name);
                     }
-                }
-                else
-                {
-                    if( ent.name != "?" )
-                    {
-                        assert(ent.subpats.size() > 0);
-                        macro_pattern_get_head_set_inner(rv, ent.subpats, 0, indirect_path, indirect_ofs+ent.subpats.size());
-                    }
+                    break;
+                case PatternHeadRv::NotFound:
+                    // Reached the end of the loop without finding a token
+                    indirect_ofs += ent.subpats.size();
 
                     // If the inner pattern didn't close the option set, then the next token can be the separator
                     if( ent.tok != TOK_NULL )
@@ -611,44 +644,63 @@ namespace {
                         {
                             if( indirect_path[indirect_ofs] != ExpTok(MacroPatEnt::PAT_TOKEN, &ent.tok) )
                             {
-                                return false;
+                                return PatternHeadRv::InvalidPath;
                             }
                             indirect_ofs ++;
+
+                            // If this is a loop (and not just an optional), attempt to repeat it
+                            if( ent.name != "?" )
+                            {
+                                assert(ent.subpats.size() > 0);
+                                macro_pattern_get_head_set_inner(rv, ent.subpats, 0, indirect_path, indirect_ofs+ent.subpats.size());
+                            }
                         }
                         else
                         {
                             rv.push_back(ExpTok(MacroPatEnt::PAT_TOKEN, &ent.tok));
+                            // Don't close the set yet, could be skipped
                         }
                     }
                     else
                     {
+                        // If this is a loop (and not just an optional), attempt to repeat it
+                        if( ent.name != "?" )
+                        {
+                            assert(ent.subpats.size() > 0);
+                            macro_pattern_get_head_set_inner(rv, ent.subpats, 0, indirect_path, indirect_ofs+ent.subpats.size());
+                        }
                     }
+                    break;
                 }
                 break;
             default:
                 if( indirect_ofs < indirect_path.size() )
                 {
+                    DEBUG("IP" << indirect_ofs << " " << indirect_path[indirect_ofs] );
                     if( indirect_path[indirect_ofs] != ExpTok(ent.type, &ent.tok) )
                     {
-                        return false;
+                        return PatternHeadRv::InvalidPath;
                     }
                     indirect_ofs ++;
                 }
                 else
                 {
+                    DEBUG("Found");
                     rv.push_back( ExpTok(ent.type, &ent.tok) );
-                    return true;
+                    return PatternHeadRv::Closed;
                 }
                 break;
             }
         }
-        return false;
+        DEBUG("Hit end");
+        return PatternHeadRv::NotFound;
     }
     ::std::vector<ExpTok> macro_pattern_get_head_set(const ::std::vector<MacroPatEnt>& pattern, size_t direct_pos, const std::vector<ExpTok>& indirect_path)
     {
         ::std::vector<ExpTok>   rv;
+        TRACE_FUNCTION_FR("", rv);
         // If the pattern set isn't closed (hit something unconditional), then add `EOF` to it
-        if( !macro_pattern_get_head_set_inner(rv, pattern, direct_pos, indirect_path, 0) )
+        if( macro_pattern_get_head_set_inner(rv, pattern, direct_pos, indirect_path, 0) != PatternHeadRv::Closed )
         {
             if(rv.empty())
             {
@@ -669,9 +721,6 @@ namespace {
             };
         auto push_ifv = [&push](bool is_equal, ::std::vector<SimplePatIfCheck> ents, size_t tgt) {
             push(SimplePatEnt::make_If({ is_equal, tgt, mv$(ents) }));
-            };
-        auto push_if = [&push_ifv](bool is_equal, MacroPatEnt::Type ty, const Token& tok, size_t tgt) {
-            push_ifv(is_equal, make_vec1(SimplePatIfCheck { ty, tok }), tgt);
             };
         for(size_t idx = 0; idx < pattern.size(); idx ++)
         {
@@ -700,39 +749,54 @@ namespace {
                 }
 
                 // - Duplicates need special handling (build up a subseqent set)
-                for(auto e_it = entry_conds.begin(); e_it != entry_conds.end(); ++e_it)
+                const size_t MAX_CONDITION_ADD = 2;
+                for(size_t iterations = 0; iterations < MAX_CONDITION_ADD; iterations ++)
                 {
-                    auto s_it = ::std::find(skip_conds.begin(), skip_conds.end(), *e_it);
-                    if( s_it != skip_conds.end() )
+                    bool did_extend = false;
+                    for(auto e_it = entry_conds.begin(); e_it != entry_conds.end(); ++e_it)
                     {
-                        auto path = ::make_vec1<ExpTok>(ExpTok(e_it->front().ty, &e_it->front().tok));
-                        auto entry_pats2 = macro_pattern_get_head_set(ent.subpats, 0, path);
-                        assert(entry_pats2.size() > 0);
-                        auto skip_pats2 = macro_pattern_get_head_set(pattern, idx+1, path);
-                        assert(skip_pats2.size() > 0);
-                        DEBUG("entry_pats2 = [" << entry_pats2 << "]");
-                        DEBUG("skip_pats2 = [" << skip_pats2 << "]");
-                        // Update the current element for both of them, and add new elements to the end of each list
+                        auto s_it = ::std::find(skip_conds.begin(), skip_conds.end(), *e_it);
+                        if( s_it != skip_conds.end() )
                         {
-                            auto e2_it = entry_pats2.begin();
-                            e_it->push_back({e2_it->ty, *e2_it->tok});
-                            for(++e2_it; e2_it != entry_pats2.end(); ++ e2_it)
-                            {
-                                e_it = entry_conds.insert(e_it, *e_it);
-                                e_it->back() = SimplePatIfCheck { e2_it->ty, *e2_it->tok };
-                            }
-                        }
+                            did_extend = true;
+                            DEBUG("Entry condition is also in skip condition: " << *e_it);
 
-                        {
-                            auto s2_it = skip_pats2.begin();
-                            s_it->push_back({s2_it->ty, *s2_it->tok});
-                            for(++s2_it; s2_it != skip_pats2.end(); ++ s2_it)
+                            std::vector<ExpTok> path;
+                            for(auto it = e_it->begin(); it != e_it->end(); ++it) {
+                                path.push_back( ExpTok(it->ty, &it->tok) );
+                            }
+                            auto entry_pats2 = macro_pattern_get_head_set(ent.subpats, 0, path);
+                            assert(entry_pats2.size() > 0);
+                            auto skip_pats2 = macro_pattern_get_head_set(pattern, idx+1, path);
+                            assert(skip_pats2.size() > 0);
+                            DEBUG("entry_pats2 = [" << entry_pats2 << "]");
+                            DEBUG("skip_pats2 = [" << skip_pats2 << "]");
+                            // Update the current element for both of them, and add new elements to the end of each list
                             {
-                                s_it = skip_conds.insert(s_it, *s_it);
-                                s_it->back() = SimplePatIfCheck { s2_it->ty, *s2_it->tok };
+                                auto e2_it = entry_pats2.begin();
+                                e_it->push_back({e2_it->ty, *e2_it->tok});
+                                for(++e2_it; e2_it != entry_pats2.end(); ++ e2_it)
+                                {
+                                    e_it = entry_conds.insert(e_it, *e_it);
+                                    e_it->back() = SimplePatIfCheck { e2_it->ty, *e2_it->tok };
+                                }
+                            }
+
+                            {
+                                auto s2_it = skip_pats2.begin();
+                                s_it->push_back({s2_it->ty, *s2_it->tok});
+                                for(++s2_it; s2_it != skip_pats2.end(); ++ s2_it)
+                                {
+                                    s_it = skip_conds.insert(s_it, *s_it);
+                                    s_it->back() = SimplePatIfCheck { s2_it->ty, *s2_it->tok };
+                                }
                             }
                         }
-                        //TODO(ent.sp, "Entry and skip patterns share an entry, ambigious - " << path);
+                    }
+                    // TODO: If any end with `:vis` then extend
+                    if( !did_extend )
+                    {
+                        break;
                     }
                 }
                 // - If there's three-level needed, error?
@@ -741,11 +805,15 @@ namespace {
                     auto s_it = ::std::find(skip_conds.begin(), skip_conds.end(), *e_it);
                     if( s_it != skip_conds.end() )
                     {
-                        TODO(ent.sp, "Entry and skip patterns share an entry, ambigious - " << *e_it);
+                        TODO(ent.sp, "Entry and skip patterns share an entry (max extend " << MAX_CONDITION_ADD << "), ambigious - " << *e_it);
                     }
                 }
-                DEBUG("Entry = [" << entry_conds << "]");
-                DEBUG("Skip = [" << skip_conds << "]");
+                for(const auto& e : entry_conds) {
+                    DEBUG("Entry += [" << e << "]");
+                }
+                for(const auto& e : skip_conds) {
+                    DEBUG("Skip += [" << e << "]");
+                }
 
                 // - Generate the repeat condition set
                 if( ent.tok != TOK_NULL )
@@ -818,7 +886,7 @@ namespace {
                     // - Enter the loop (if the next token is one of the head set of the loop)
                     // - Skip the loop (the next token is the head set of the subsequent entries)
                     size_t rewrite_start = rv.size();
-                    if( entry_conds.size() == 1 )
+                    if( entry_conds.size() == 1 && entry_conds[0].back().tok != TOK_EOF )    // HACK: if the entry ends with `EOF` then it won't be correct
                     {
                         // If not the entry pattern, skip.
                         push_ifv(false, entry_conds.front(), ~0u);

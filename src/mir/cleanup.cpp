@@ -253,40 +253,9 @@ const EncodedLiteral* MIR_Cleanup_GetConstant(const MIR::TypeResolve& state, con
         }
         else if( te.binding.is_Enum() )
         {
-            unsigned var_idx = 0;
-            TU_MATCH_HDRA( (repr->variants), {)
-            TU_ARMA(None, ve) {
-                }
-            TU_ARMA(NonZero, ve) {
-                size_t ofs = repr->get_offset(state.sp, state.m_resolve, ve.field);
-                bool is_nonzero = false;
-                for(size_t i = 0; i < ve.field.size; i ++) {
-                    if( lit.slice(ofs+i, 1).read_uint(1) != 0 ) {
-                        is_nonzero = true;
-                        break;
-                    }
-                }
-
-                var_idx = (is_nonzero ? 1 - ve.zero_variant : ve.zero_variant);
-                }
-            TU_ARMA(Linear, ve) {
-                auto v = lit.slice( repr->get_offset(state.sp, state.m_resolve, ve.field), ve.field.size).read_uint(ve.field.size);
-                if( v < ve.offset ) {
-                    var_idx = ve.field.index;
-                    DEBUG("VariantMode::Linear - Niche #" << var_idx);
-                }
-                else {
-                    var_idx = v - ve.offset;
-                    DEBUG("VariantMode::Linear - Other #" << var_idx);
-                }
-                }
-            TU_ARMA(Values, ve) {
-                auto v = lit.slice( repr->get_offset(state.sp, state.m_resolve, ve.field), ve.field.size).read_uint(ve.field.size);
-                auto it = std::find(ve.values.begin(), ve.values.end(), v);
-                MIR_ASSERT(state, it != ve.values.end(), "Invalid enum tag: " << v << " for " << ty);
-                var_idx = it - ve.values.begin();
-                }
-            }
+            auto var_info = repr->get_enum_variant(state.sp, state.m_resolve, lit);
+            unsigned var_idx = var_info.first;
+            bool has_tag_field = var_info.second;
 
             const auto& enm = *te.binding.as_Enum();
 
@@ -294,7 +263,6 @@ const EncodedLiteral* MIR_Cleanup_GetConstant(const MIR::TypeResolve& state, con
             if( enm.m_data.is_Data() )
             {
                 const auto& fld = repr->fields.at(var_idx);
-                bool has_tag_field = repr->variants.is_Linear() && !repr->variants.as_Linear().uses_niche();
 
                 size_t base_ofs = fld.offset;
                 const auto* repr = Target_GetTypeRepr(state.sp, state.m_resolve, fld.ty);
@@ -689,6 +657,10 @@ bool MIR_Cleanup_Unsize_GetMetadata(const ::MIR::TypeResolve& state, MirMutator&
         if( src_ty.data().is_Array() )
         {
             const auto& in_array = src_ty.data().as_Array();
+            if( !in_array.size.is_Known() ) {
+                DEBUG("Array size not yet known - " << in_array.size);
+                return false;
+            }
             out_meta_ty = ::HIR::CoreType::Usize;
             out_meta_val = ::MIR::Constant::make_Uint({ in_array.size.as_Known(), ::HIR::CoreType::Usize });
             return true;
@@ -788,8 +760,8 @@ bool MIR_Cleanup_Unsize_GetMetadata(const ::MIR::TypeResolve& state, MirMutator&
     }
     else
     {
-        // Emit a cast rvalue, as something is still generic.
-        return ::MIR::RValue::make_Cast({ mv$(ptr_value), dst_ty.clone() });
+        // Re-emit the "unsize" pseudo-op
+        return ::MIR::RValue::make_MakeDst({ mv$(ptr_value), MIR::Constant::make_ItemAddr({}) });
     }
 }
 
@@ -1093,6 +1065,21 @@ void MIR_Cleanup(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path,
                 for(auto& v : se.outputs)
                     MIR_Cleanup_LValue(state, mutator,  v.second);
                 }
+            TU_ARMA(Asm2, e) {
+                for(auto& p : e.params)
+                {
+                    TU_MATCH_HDRA( (p), { )
+                    TU_ARMA(Const, v) {}
+                    TU_ARMA(Sym, v) {}
+                    TU_ARMA(Reg, v) {
+                        if(v.input)
+                            MIR_Cleanup_Param(state, mutator, *v.input);
+                        if(v.output)
+                            MIR_Cleanup_LValue(state, mutator,  *v.output);
+                        }
+                    }
+                }
+                }
             TU_ARMA(Assign, se) {
                 MIR_Cleanup_LValue(state, mutator,  se.dst);
                 TU_MATCH_HDRA( (se.src), {)
@@ -1202,39 +1189,25 @@ void MIR_Cleanup(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path,
                     }
                 }
 
-                // Fix up RValue::Cast into coercions
-                if( auto* e = se.src.opt_Cast() )
+                // Fix up coercions
+                if( auto* e = se.src.opt_MakeDst() )
                 {
-                    ::HIR::TypeRef  tmp;
-                    const auto& src_ty = state.get_lvalue_type(tmp, e->val);
-                    // TODO: Unsize and CoerceUnsized operations
-                    // - Unsize should create a fat pointer if the pointer class is known (vtable or len)
-                    if( /*auto* te =*/ e->type.data().opt_Borrow() )
-                    {
-                        //  > & -> & = Unsize, create DST based on the pointer class of the destination.
-                        // (&-ptr being destination is otherwise invalid)
-                        // TODO Share with the CoerceUnsized handling?
-                        se.src = MIR_Cleanup_CoerceUnsized(state, mutator, e->type, src_ty, mv$(e->val));
+                    if( TU_TEST2(e->meta_val, Constant, ,ItemAddr, .get() == nullptr) ) {
+                        ::HIR::TypeRef  tmp, tmp2;
+                        const auto& src_ty = state.get_param_type(tmp, e->ptr_val);
+                        const auto& dst_ty = state.get_lvalue_type(tmp2, se.dst);
+                        se.src = MIR_Cleanup_CoerceUnsized(state, mutator, dst_ty, src_ty, mv$(e->ptr_val.as_LValue()));
                     }
-                    // - CoerceUnsized should re-create the inner type if known.
-                    else if(const auto* dte = e->type.data().opt_Path())
-                    {
-                        if(const auto* ste = src_ty.data().opt_Path())
-                        {
-                            ASSERT_BUG( sp, !dte->binding.is_Unbound(), "" );
-                            ASSERT_BUG( sp, !ste->binding.is_Unbound(), "" );
-                            if( dte->binding.is_Opaque() || ste->binding.is_Opaque() ) {
-                                // Either side is opaque, leave for now
-                            }
-                            else {
-                                se.src = MIR_Cleanup_CoerceUnsized(state, mutator, e->type, src_ty, mv$(e->val));
-                            }
-                        }
-                        else {
-                            ASSERT_BUG( sp, src_ty.data().is_Generic(), "Cast to Path from " << src_ty );
-                        }
-                    }
-                    else {
+                }
+
+                if( auto* e = se.src.opt_MakeDst() )
+                {
+                    if( TU_TEST2(e->meta_val, Constant, ,ItemAddr, .get() == nullptr) ) {
+                        // TODO: Check the validity?
+                        // - Ensure that something is generic in either the destination or source 
+                        ::HIR::TypeRef  tmp;
+                        const auto& src_ty = state.get_param_type(tmp, e->ptr_val);
+                        MIR_ASSERT(state, monomorphise_type_needed(src_ty), "MakeDst Unsize with known source - " << src_ty);
                     }
                 }
             }

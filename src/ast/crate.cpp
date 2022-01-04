@@ -96,10 +96,9 @@ void Crate::load_externs()
             no_std = true;
         if( a.name() == "no_core" )
             no_core = true;
-        if( a.name() == "cfg_attr" && a.items().size() == 2 ) {
-            if( check_cfg(a.span(), a.items().at(0)) )
+        if( a.name() == "cfg_attr" ) {
+            for(const auto& a2 : check_cfg_attr(a))
             {
-                const auto& a2 = a.items().at(1);
                 if( a2.name() == "no_std" )
                     no_std = true;
                 if( a2.name() == "no_core" )
@@ -269,6 +268,10 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
     auto res = m_extern_crates.insert(::std::make_pair( real_name, mv$(ec) ));
     if( !res.second ) {
         // Crate already loaded?
+        DEBUG("Duplicate load of '" << real_name);
+        return real_name;
+    }
+    else {
     }
     auto& ext_crate = res.first->second;
     // Move the external list out (doesn't need to be kept in the nested crate)
@@ -288,6 +291,8 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
             }
         }
     }
+    // NOTE: Add the crate to the ordered list AFTER its dependencies
+    m_extern_crates_ord.push_back(real_name);
 
     if( ext_crate.m_short_name == "core" ) {
         if( this->m_ext_cratename_core == "" ) {

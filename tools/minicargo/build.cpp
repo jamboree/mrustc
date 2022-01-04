@@ -52,6 +52,46 @@ extern int _putenv_s(const char*, const char*);
 # include <sys/sysctl.h>
 #endif
 
+
+namespace {
+    enum class TerminalColour {
+        Default,
+        Red,    // ANSI 1
+        Green  // ANSI 2
+    };
+    void set_console_colour(std::ostream& os, TerminalColour colour) {
+#if defined(_WIN32) && !defined(__MINGW32__)
+        HANDLE  h;
+        WORD default_val;
+        if( &os == &std::cout ) {
+            h = GetStdHandle(STD_OUTPUT_HANDLE);
+            default_val = FOREGROUND_INTENSITY | FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+        }
+        else if( &os == &std::cerr ) {
+            h = GetStdHandle(STD_ERROR_HANDLE);
+            default_val = FOREGROUND_INTENSITY | FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+        }
+        else {
+            return ;
+        }
+        switch(colour)
+        {
+        case TerminalColour::Default: SetConsoleTextAttribute(h, default_val); break;
+        case TerminalColour::Red  : SetConsoleTextAttribute(h, FOREGROUND_INTENSITY | FOREGROUND_RED); break;
+        case TerminalColour::Green: SetConsoleTextAttribute(h, FOREGROUND_INTENSITY | FOREGROUND_GREEN); break;
+        }
+#else
+        // TODO: Only enable if printing to a terminal (not to a file)
+        switch(colour)
+        {
+        case TerminalColour::Default:   os << "\x1B[0m";    break;
+        case TerminalColour::Red  :     os << "\x1B[31m";   break;
+        case TerminalColour::Green:     os << "\x1B[32m";   break;
+        }
+#endif
+    };
+}
+
 #ifdef _WIN32
 # define EXESUF ".exe"
 # define DLLSUF ".dll"
@@ -78,6 +118,8 @@ public:
     ::helpers::path build_build_script(const PackageManifest& manifest, bool is_for_host, bool* out_is_rebuilt) const;
 
 private:
+    ::std::string get_crate_suffix(const PackageManifest& manifest) const;
+    ::std::string get_build_script_out(const PackageManifest& manifest) const;
     ::helpers::path get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix) const;
     bool spawn_process_mrustc(const StringList& args, StringListKV env, const ::helpers::path& logfile) const;
 
@@ -171,27 +213,23 @@ BuildList::BuildList(const PackageManifest& manifest, const BuildOptions& opts):
         }
         void add_dependencies(const PackageManifest& p, unsigned level, bool include_build, bool is_native)
         {
-            for (const auto& dep : p.dependencies())
-            {
-                if( dep.is_disabled() )
+            p.iter_main_dependencies([&](const PackageRef& dep) {
+                if( !dep.is_disabled() )
                 {
-                    continue ;
+                    DEBUG(p.name() << ": Dependency " << dep.name());
+                    add_package(dep.get_package(), level+1, include_build, is_native);
                 }
-                DEBUG(p.name() << ": Dependency " << dep.name());
-                add_package(dep.get_package(), level+1, include_build, is_native);
-            }
+            });
 
             if( p.build_script() != "" && include_build )
             {
-                for(const auto& dep : p.build_dependencies())
-                {
-                    if( dep.is_disabled() )
+                p.iter_build_dependencies([&](const PackageRef& dep) {
+                    if( !dep.is_disabled() )
                     {
-                        continue ;
+                        DEBUG(p.name() << ": Build Dependency " << dep.name());
+                        add_package(dep.get_package(), level+1, true, true);
                     }
-                    DEBUG(p.name() << ": Build Dependency " << dep.name());
-                    add_package(dep.get_package(), level+1, true, true);
-                }
+                });
             }
         }
         void sort_list()
@@ -225,15 +263,13 @@ BuildList::BuildList(const PackageManifest& manifest, const BuildOptions& opts):
     }
     if( opts.mode != BuildOptions::Mode::Normal)
     {
-        for(const auto& dep : manifest.dev_dependencies())
-        {
-            if( dep.is_disabled() )
+        manifest.iter_dev_dependencies([&](const PackageRef& dep) {
+            if( !dep.is_disabled() )
             {
-                continue ;
+                DEBUG(manifest.name() << ": Dependency " << dep.name());
+                b.add_package(dep.get_package(), 1, !opts.build_script_overrides.is_valid(), !cross_compiling);
             }
-            DEBUG(manifest.name() << ": Dependency " << dep.name());
-            b.add_package(dep.get_package(), 1, !opts.build_script_overrides.is_valid(), !cross_compiling);
-        }
+        });
     }
 
     // TODO: Add the binaries too?
@@ -255,22 +291,20 @@ BuildList::BuildList(const PackageManifest& manifest, const BuildOptions& opts):
         for(size_t j = i+1; j < m_list.size(); j ++)
         {
             const auto& p = *m_list[j].package;
-            for( const auto& dep : p.dependencies() )
-            {
+            p.iter_main_dependencies([&](const PackageRef& dep) {
                 if( !dep.is_disabled() && &dep.get_package() == cur )
                 {
                     m_list[i].dependents.push_back(static_cast<unsigned>(j));
                 }
-            }
+            });
             if( p.build_script() != "" && !opts.build_script_overrides.is_valid() )
             {
-                for(const auto& dep : p.build_dependencies())
-                {
+                p.iter_build_dependencies([&](const PackageRef& dep) {
                     if( !dep.is_disabled() && &dep.get_package() == cur )
                     {
                         m_list[i].dependents.push_back(static_cast<unsigned>(j));
                     }
-                }
+                });
             }
         }
     }
@@ -321,25 +355,21 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs)
         auto idx = static_cast<unsigned>(state.num_deps_remaining.size());
         const auto& p = *e.package;
         unsigned n_deps = 0;
-        for (const auto& dep : p.dependencies())
-        {
-            if( dep.is_disabled() )
+        p.iter_main_dependencies([&](const PackageRef& dep) {
+            if( !dep.is_disabled() )
             {
-                continue ;
+                n_deps ++;
             }
-            n_deps ++;
-        }
+        });
 
         if( p.build_script() != "" && include_build )
         {
-            for(const auto& dep : p.build_dependencies())
-            {
-                if( dep.is_disabled() )
+            p.iter_build_dependencies([&](const PackageRef& dep) {
+                if( !dep.is_disabled() )
                 {
-                    continue ;
+                    n_deps ++;
                 }
-                n_deps ++;
-            }
+            });
         }
         // If there's no dependencies for this package, add it to the build queue
         if( n_deps == 0 )
@@ -412,47 +442,56 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs)
             {
                 const auto& list = *list_p;
                 auto& queue = *queue_p;
-                for(;;)
+                try
                 {
-                    DEBUG("Thread " << my_idx << ": waiting");
-                    queue.avaliable_tasks.wait();
+                    for(;;)
+                    {
+                        DEBUG("Thread " << my_idx << ": waiting");
+                        queue.avaliable_tasks.wait();
 
-                    if( queue.complete || queue.failure )
-                    {
-                        DEBUG("Thread " << my_idx << ": Terminating");
-                        break;
-                    }
-
-                    unsigned cur;
-                    {
-                        ::std::lock_guard<::std::mutex> sl { queue.mutex };
-                        cur = queue.state.get_next();
-                        queue.num_active ++;
-                    }
-
-                    DEBUG("Thread " << my_idx << ": Starting " << cur << " - " << list[cur].package->name());
-                    if( ! builder->build_library(*list[cur].package, list[cur].is_host, cur) )
-                    {
-                        queue.failure = true;
-                        queue.signal_all();
-                    }
-                    else
-                    {
-                        ::std::lock_guard<::std::mutex> sl { queue.mutex };
-                        queue.num_active --;
-                        int v = queue.state.complete_package(cur, list);
-                        while(v--)
+                        if( queue.complete || queue.failure )
                         {
-                            queue.avaliable_tasks.notify();
+                            DEBUG("Thread " << my_idx << ": Terminating");
+                            break;
                         }
 
-                        // If the queue is empty, and there's no active jobs, stop.
-                        if( queue.state.build_queue.empty() && queue.num_active == 0 )
+                        unsigned cur;
                         {
-                            queue.complete = true;
+                            ::std::lock_guard<::std::mutex> sl { queue.mutex };
+                            cur = queue.state.get_next();
+                            queue.num_active ++;
+                        }
+
+                        DEBUG("Thread " << my_idx << ": Starting " << cur << " - " << list[cur].package->name());
+                        if( ! builder->build_library(*list[cur].package, list[cur].is_host, cur) )
+                        {
+                            queue.failure = true;
                             queue.signal_all();
                         }
+                        else
+                        {
+                            ::std::lock_guard<::std::mutex> sl { queue.mutex };
+                            queue.num_active --;
+                            int v = queue.state.complete_package(cur, list);
+                            while(v--)
+                            {
+                                queue.avaliable_tasks.notify();
+                            }
+
+                            // If the queue is empty, and there's no active jobs, stop.
+                            if( queue.state.build_queue.empty() && queue.num_active == 0 )
+                            {
+                                queue.complete = true;
+                                queue.signal_all();
+                            }
+                        }
                     }
+                }
+                catch(const std::exception& e)
+                {
+                    ::std::cerr << "EXCEPTION: " << e.what() << ::std::endl;
+                    queue.failure = true;
+                    queue.signal_all();
                 }
 
                 queue.dead_threads.notify();
@@ -576,9 +615,8 @@ Builder::Builder(const BuildOptions& opts, size_t total_targets):
     m_compiler_path = get_mrustc_path();
 }
 
-::helpers::path Builder::get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix) const
+::std::string Builder::get_crate_suffix(const PackageManifest& manifest) const
 {
-    auto outfile = this->get_output_dir(is_for_host);
     ::std::string   crate_suffix;
     // HACK: If there's no version, don't emit a version tag
     //if( manifest.version() != PackageVersion() ) 
@@ -619,6 +657,17 @@ Builder::Builder(const BuildOptions& opts, size_t total_targets):
                 v = '_';
 #endif
     }
+    return crate_suffix;
+}
+::std::string Builder::get_build_script_out(const PackageManifest& manifest) const
+{
+    return std::string("build_") + manifest.name().c_str() + (manifest.version() == PackageVersion() ? "" : get_crate_suffix(manifest).c_str());
+}
+::helpers::path Builder::get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix) const
+{
+    auto outfile = this->get_output_dir(is_for_host);
+
+    auto crate_suffix = get_crate_suffix(manifest);
 
     if(out_crate_suffix)
         *out_crate_suffix = crate_suffix;
@@ -789,8 +838,7 @@ namespace {
         env.push_back("CARGO_PKG_VERSION_MINOR", ::format(manifest.version().minor));
         env.push_back("CARGO_PKG_VERSION_PATCH", ::format(manifest.version().patch));
         // - Downstream environment variables
-        for(const auto& dep : manifest.dependencies())
-        {
+        manifest.iter_main_dependencies([&](const PackageRef& dep) {
             if( ! dep.is_disabled() )
             {
                 const auto& m = dep.get_package();
@@ -799,7 +847,7 @@ namespace {
                     env.push_back(p.first.c_str(), p.second.c_str());
                 }
             }
-        }
+        });
     }
 }
 
@@ -870,6 +918,7 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
 #ifndef DISABLE_MULTITHREAD
         ::std::lock_guard<::std::mutex> lh { s_cout_mutex };
 #endif
+        set_console_colour(std::cout, TerminalColour::Green);
         // TODO: Determine what number and total targets there are
         if( index != ~0u ) {
             //::std::cout << "(" << index << "/" << m_total_targets << ") ";
@@ -881,6 +930,7 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
         ::std::cout << manifest.name() << " v" << manifest.version();
         if( !manifest.active_features().empty() )
             ::std::cout << " with features [" << manifest.active_features() << "]";
+        set_console_colour(std::cout, TerminalColour::Default);
         ::std::cout << ::std::endl;
     }
     StringList  args;
@@ -937,7 +987,12 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
         args.push_back("-L"); args.push_back(dir.second.c_str());
     }
     for(const auto& lib : manifest.build_script_output().rustc_link_lib) {
-        args.push_back("-l"); args.push_back(lib.second.c_str());
+        if(!strcmp(lib.first, "framework")) {
+            args.push_back("-l"); args.push_back(format("framework=",lib.second.c_str()));
+        }
+        else {
+            args.push_back("-l"); args.push_back(lib.second.c_str());
+        }
     }
     for(const auto& cfg : manifest.build_script_output().rustc_cfg) {
         args.push_back("--cfg"); args.push_back(cfg.c_str());
@@ -982,20 +1037,23 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
             return rv;
         }
     };
-    for(const auto& dep : manifest.dependencies())
-    {
+    manifest.iter_main_dependencies([&](const PackageRef& dep) {
         if( ! dep.is_disabled() )
         {
             const auto& m = dep.get_package();
             auto path = this->get_crate_path(m, m.get_library(), is_for_host, nullptr, nullptr);
             args.push_back("--extern");
-            args.push_back(::format(H::escape_dashes(dep.key()), "=", path));
+            if( dep.key() != m.name() ) {
+                args.push_back(::format(H::escape_dashes(dep.key()), "=", path));
+            }
+            else {
+                args.push_back(::format(m.get_library().m_name, "=", path));
+            }
         }
-    }
+    });
     if( target.m_type == PackageTarget::Type::Test )
     {
-        for(const auto& dep : manifest.dev_dependencies())
-        {
+        manifest.iter_dev_dependencies([&](const PackageRef& dep) {
             if( ! dep.is_disabled() )
             {
                 const auto& m = dep.get_package();
@@ -1003,13 +1061,16 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
                 args.push_back("--extern");
                 args.push_back(::format(H::escape_dashes(dep.key()), "=", path));
             }
-        }
+        });
     }
 
     // Environment variables (rustc_env)
     StringListKV    env;
-    auto out_dir = this->get_output_dir(is_for_host).to_absolute() / "build_" + manifest.name().c_str();
+    auto out_dir = this->get_output_dir(is_for_host).to_absolute() / get_build_script_out(manifest);
     env.push_back("OUT_DIR", out_dir.str());
+    for(const auto& e : manifest.build_script_output().rustc_env) {
+        env.push_back(e.first.c_str(), e.second.c_str());
+    }
     push_env_common(env, manifest);
 
     // TODO: If emitting command files (i.e. cross-compiling), concatenate the contents of `outfile + ".sh"` onto a
@@ -1020,7 +1081,7 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
 ::helpers::path Builder::build_build_script(const PackageManifest& manifest, bool is_for_host, bool* out_is_rebuilt) const
 {
     // - Output dir is the same as the library.
-    auto outfile = this->get_output_dir(is_for_host) / manifest.name() + "_build" EXESUF;
+    auto outfile = this->get_output_dir(is_for_host) / get_build_script_out(manifest) + "_run" EXESUF;
 
     auto ts_result = Timestamp::for_file(outfile);
     if( ts_result == Timestamp::infinite_past() ) {
@@ -1053,8 +1114,7 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
         args.push_back("-L");
         args.push_back(d.str().c_str());
     }
-    for(const auto& dep : manifest.build_dependencies())
-    {
+    manifest.iter_build_dependencies([&](const PackageRef& dep) {
         if( ! dep.is_disabled() )
         {
             const auto& m = dep.get_package();
@@ -1062,7 +1122,7 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
             args.push_back("--extern");
             args.push_back(::format(m.get_library().m_name, "=", path));
         }
-    }
+    });
     for(const auto& feat : manifest.active_features())
     {
         args.push_back("--cfg"); args.push_back(::format("feature=", feat));
@@ -1108,8 +1168,8 @@ bool Builder::build_target(const PackageManifest& manifest, const PackageTarget&
 {
     auto output_dir_abs = this->get_output_dir(is_for_host).to_absolute();
 
-    auto out_file = output_dir_abs / "build_" + manifest.name().c_str() + ".txt";
-    auto out_dir = output_dir_abs / "build_" + manifest.name().c_str();
+    auto out_file = output_dir_abs / get_build_script_out(manifest) + ".txt";
+    auto out_dir = output_dir_abs / get_build_script_out(manifest);
 
     bool run_build_script = false;
     // TODO: Handle a pre-existing script containing `cargo:rerun-if-changed`
@@ -1202,6 +1262,7 @@ bool Builder::build_library(const PackageManifest& manifest, bool is_for_host, s
         // Locate a build script override file
         if(this->m_opts.build_script_overrides.is_valid())
         {
+            //auto override_file = this->m_opts.build_script_overrides / get_build_script_out(manifest) + ".txt";
             auto override_file = this->m_opts.build_script_overrides / "build_" + manifest.name().c_str() + ".txt";
             // TODO: Should this test if it exists? or just assume and let it error?
 
@@ -1226,7 +1287,15 @@ bool Builder::build_library(const PackageManifest& manifest, bool is_for_host, s
 bool Builder::spawn_process_mrustc(const StringList& args, StringListKV env, const ::helpers::path& logfile) const
 {
     //env.push_back("MRUSTC_DEBUG", "");
-    return spawn_process(m_compiler_path.str().c_str(), args, env, logfile);
+    auto rv = spawn_process(m_compiler_path.str().c_str(), args, env, logfile);
+    if(getenv("MINICARGO_RUN_ONCE") || getenv("MINICARGO_RUN_ONCE"))
+    {
+        if(rv) {
+            std::cerr << "- Only running compiler once" << std::endl;
+        }
+        exit(1);
+    }
+    return rv;
 }
 
 const helpers::path& get_mrustc_path()
@@ -1291,6 +1360,16 @@ const helpers::path& get_mrustc_path()
 
 bool spawn_process(const char* exe_name, const StringList& args, const StringListKV& env, const ::helpers::path& logfile, const ::helpers::path& working_directory/*={}*/)
 {
+    if( getenv("MINICARGO_DUMPENV") )
+    {
+        ::std::stringstream environ_str;
+        for(auto kv : env)
+        {
+            environ_str << kv.first << "=" << kv.second << ' ';
+        }
+        std::cout << environ_str.str() << std::endl;
+    }
+
 #ifdef _WIN32
     ::std::stringstream cmdline;
     cmdline << exe_name;
@@ -1358,7 +1437,13 @@ bool spawn_process(const char* exe_name, const StringList& args, const StringLis
     GetExitCodeProcess(pi.hProcess, &status);
     if (status != 0)
     {
-        DEBUG("Process exited with non-zero exit status " << status);
+#ifndef DISABLE_MULTITHREAD
+        ::std::lock_guard<::std::mutex> lh { s_cout_mutex };
+#endif
+        set_console_colour(std::cerr, TerminalColour::Red);
+        std::cerr << "Process `" << cmdline_str << "` exited with non-zero exit status " << status;
+        set_console_colour(std::cerr, TerminalColour::Default);
+        std::cerr << std::endl;
         return false;
     }
 #else
@@ -1425,7 +1510,13 @@ bool spawn_process(const char* exe_name, const StringList& args, const StringLis
         }
         if( posix_spawn(&pid, exe_name, &fa, /*attr=*/nullptr, (char* const*)argv.data(), (char* const*)envp.get_vec().data()) != 0 )
         {
-            ::std::cerr << "Unable to run process '" << exe_name << "' - " << strerror(errno) << ::std::endl;
+#ifndef DISABLE_MULTITHREAD
+            ::std::lock_guard<::std::mutex> lh { s_cout_mutex };
+#endif
+            set_console_colour(std::cerr, TerminalColour::Red);
+            ::std::cerr << "Unable to run process '" << exe_name << "' - " << strerror(errno);
+            set_console_colour(std::cerr, TerminalColour::Default);
+            ::std::cerr << ::std::endl;
             DEBUG("Unable to spawn executable");
             posix_spawn_file_actions_destroy(&fa);
             return false;
@@ -1439,12 +1530,21 @@ bool spawn_process(const char* exe_name, const StringList& args, const StringLis
     waitpid(pid, &status, 0);
     if( status != 0 )
     {
+#ifndef DISABLE_MULTITHREAD
+        ::std::lock_guard<::std::mutex> lh { s_cout_mutex };
+#endif
+        set_console_colour(std::cerr, TerminalColour::Red);
         if( WIFEXITED(status) )
             ::std::cerr << "Process exited with non-zero exit status " << WEXITSTATUS(status) << ::std::endl;
         else if( WIFSIGNALED(status) )
             ::std::cerr << "Process was terminated with signal " << WTERMSIG(status) << ::std::endl;
         else
             ::std::cerr << "Process terminated for unknown reason, status=" << status << ::std::endl;
+        set_console_colour(std::cerr, TerminalColour::Default);
+        ::std::cerr << "FAILING COMMAND: ";
+        for(const auto& p : argv)
+            ::std::cerr  << " " << p;
+        ::std::cerr << ::std::endl;
         //::std::cerr << "See " << logfile << " for the compiler output" << ::std::endl;
         return false;
     }

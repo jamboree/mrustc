@@ -204,50 +204,11 @@ namespace {
             out_builder.end_block( ::MIR::Terminator::make_Switch({ mv$(stmt_idx_lv), mv$(arms) }) );
         }
 
-        void destructure_from(const Span& sp, const ::HIR::Pattern& pat, ::MIR::LValue lval, bool allow_refutable=false) override
-        {
-            auto cb = [&](const HIR::PatternBinding& binding, ::MIR::LValue lval) {
-                MIR::RValue rv;
-                switch( binding.m_type )
-                {
-                case ::HIR::PatternBinding::Type::Move:
-                    rv = mv$(lval);
-                    break;
-                case ::HIR::PatternBinding::Type::Ref:
-                    if(m_borrow_raise_target)
-                    {
-                        DEBUG("- Raising destructure borrow of " << lval << " to scope " << *m_borrow_raise_target);
-                        m_builder.raise_temporaries(sp, lval, *m_borrow_raise_target);
-                    }
-
-                    rv = ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Shared, mv$(lval) });
-                    break;
-                case ::HIR::PatternBinding::Type::MutRef:
-                    if(m_borrow_raise_target)
-                    {
-                        DEBUG("- Raising destructure borrow of " << lval << " to scope " << *m_borrow_raise_target);
-                        m_builder.raise_temporaries(sp, lval, *m_borrow_raise_target);
-                    }
-                    rv = ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Unique, mv$(lval) });
-                    break;
-                }
-                m_builder.push_stmt_assign( sp, m_builder.get_variable(sp, binding.m_slot), mv$(rv) );
-                };
-            destructure_from_ex(sp, pat, mv$(lval), cb, (allow_refutable ? AllowRefutable::Yes : AllowRefutable::No));
-        }
-        void destructure_aliases_from(const Span& sp, const ::HIR::Pattern& pat, ::MIR::LValue lval, bool allow_refutable=false) override
-        {
-            auto cb = [&](const HIR::PatternBinding& binding, ::MIR::LValue lv) {
-                m_builder.add_variable_alias(sp, binding.m_slot, binding.m_type, mv$(lv));
-            };
-            destructure_from_ex(sp, pat, mv$(lval), cb, (allow_refutable ? AllowRefutable::Yes : AllowRefutable::No));
-        }
-
         // Brings variables defined in `pat` into scope
         void define_vars_from(const Span& sp, const ::HIR::Pattern& pat) override
         {
-            if( pat.m_binding.is_valid() ) {
-                m_builder.define_variable( pat.m_binding.m_slot );
+            for(const auto& pb : pat.m_bindings) {
+                m_builder.define_variable( pb.m_slot );
             }
 
             TU_MATCHA( (pat.m_data), (e),
@@ -309,288 +270,117 @@ namespace {
                 {
                     define_vars_from(sp, subpat);
                 }
+                ),
+            (Or,
+                assert(e.size() > 0);
+                // TODO: Save variable state, visit in order (resetting/checking after each)
+                define_vars_from(sp, e[0]);
                 )
             )
         }
 
-        enum class AllowRefutable
+        MIR::LValue get_value_for_binding_path(const Span& sp, const ::HIR::TypeRef& outer_ty, const ::MIR::LValue& outer_lval, const PatternBinding& b)
         {
-            No,
-            Yes,
-            NoBindings,
-            IgnoreBindings,
-        };
+            MIR::LValue lval;
+            HIR::TypeRef    ty;
 
-        void destructure_from_ex(const Span& sp, const ::HIR::Pattern& pat, ::MIR::LValue lval, std::function<void (const HIR::PatternBinding& binding, MIR::LValue lval)> cb, AllowRefutable allow_refutable = AllowRefutable::No) // 1 : yes, 2 : disallow binding
-        {
-            TRACE_FUNCTION_F(pat << " := " << lval << ", allow_refutable=" << static_cast<int>(allow_refutable));
-            if( allow_refutable != AllowRefutable::IgnoreBindings && pat.m_binding.is_valid() ) {
-                if( allow_refutable == AllowRefutable::NoBindings ) {
-                    BUG(sp, "Binding when not expected");
-                }
-                else if( allow_refutable == AllowRefutable::No ) {
-                    ASSERT_BUG(sp, pat.m_data.is_Any(), "Destructure patterns can't bind and match");
-                }
-                else {
-                    // Refutable and binding allowed
-                    destructure_from_ex(sp, pat, lval.clone(), cb, AllowRefutable::IgnoreBindings);
-                }
+            MIR_LowerHIR_GetTypeValueForPath(sp, m_builder, outer_ty, outer_lval, b.field, ty, lval);
 
-                for(size_t i = 0; i < pat.m_binding.m_implicit_deref_count; i ++)
-                {
-                    lval = ::MIR::LValue::new_Deref(mv$(lval));
-                }
-
-                cb(pat.m_binding, std::move(lval));
-                return;
-            }
-            if( allow_refutable == AllowRefutable::IgnoreBindings ) {
-                allow_refutable = AllowRefutable::NoBindings;
-            }
-
-            for(size_t i = 0; i < pat.m_implicit_deref_count; i ++)
+            if(b.is_split_slice())
             {
-                lval = ::MIR::LValue::new_Deref(mv$(lval));
+                struct H {
+                    static ::HIR::BorrowType get_borrow_type(const Span& sp, const ::HIR::PatternBinding& pb) {
+                        switch(pb.m_type)
+                        {
+                        case ::HIR::PatternBinding::Type::Move:
+                            BUG(sp, "By-value pattern binding of a slice");
+                        case ::HIR::PatternBinding::Type::Ref:
+                            return ::HIR::BorrowType::Shared;
+                        case ::HIR::PatternBinding::Type::MutRef:
+                            return ::HIR::BorrowType::Unique;
+                        }
+                        throw "";
+                    }
+                };
+
+                if( ty.data().is_Array() )
+                {
+                    TODO(sp, "SplitSlice binding: Array - " << b.split_slice);
+                }
+                else if( const auto* tep = ty.data().opt_Slice() )
+                {
+                    auto inner_type = tep->inner.clone_shallow();
+
+                    // 1. Obtain remaining length
+                    auto src_len_lval = m_builder.lvalue_or_temp(sp, ::HIR::CoreType::Usize, ::MIR::RValue::make_DstMeta({ m_builder.get_ptr_to_dst(sp, lval) }));
+                    unsigned sub_val_i = static_cast<unsigned>(b.split_slice.first + b.split_slice.second);
+                    auto sub_val = ::MIR::Param(::MIR::Constant::make_Uint({ sub_val_i, ::HIR::CoreType::Usize }));
+                    ::MIR::LValue len_val = m_builder.lvalue_or_temp(sp, ::HIR::CoreType::Usize, ::MIR::RValue::make_BinOp({ mv$(src_len_lval), ::MIR::eBinOp::SUB, mv$(sub_val) }) );
+
+                    // 2. Obtain pointer to the first element
+                    ::HIR::BorrowType   bt = H::get_borrow_type(sp, *b.binding);
+                    ::MIR::LValue ptr_val = m_builder.lvalue_or_temp(sp,
+                        ::HIR::TypeRef::new_borrow( bt, std::move(inner_type) ),
+                        ::MIR::RValue::make_Borrow({ bt, ::MIR::LValue::new_Field( lval.clone(), static_cast<unsigned int>(b.split_slice.first) ) })
+                    );
+
+                    // 3. Create a slice pointer
+                    lval = m_builder.lvalue_or_temp(sp, ::HIR::TypeRef::new_borrow(bt, ty.clone()), ::MIR::RValue::make_MakeDst({ mv$(ptr_val), mv$(len_val) }) );
+                    // 4. And dereference it
+                    lval = ::MIR::LValue::new_Deref(std::move(lval));
+                }
+                else
+                {
+                    TODO(sp, "SplitSlice binding: " << b.split_slice << " - " << ty);
+                }
             }
 
-            TU_MATCH_HDRA( (pat.m_data), {)
-            TU_ARMA(Any, e) {
-                }
-            TU_ARMA(Box, e) {
-                destructure_from_ex(sp, *e.sub, ::MIR::LValue::new_Deref(mv$(lval)), cb, allow_refutable);
-                }
-            TU_ARMA(Ref, e) {
-                destructure_from_ex(sp, *e.sub, ::MIR::LValue::new_Deref(mv$(lval)), cb, allow_refutable);
-                }
-            TU_ARMA(Tuple, e) {
-                for(unsigned int i = 0; i < e.sub_patterns.size(); i ++ )
-                {
-                    destructure_from_ex(sp, e.sub_patterns[i], ::MIR::LValue::new_Field(lval.clone(), i), cb, allow_refutable);
-                }
-                }
-            TU_ARMA(SplitTuple, e) {
-                assert(e.total_size >= e.leading.size() + e.trailing.size());
-                for(unsigned int i = 0; i < e.leading.size(); i ++ )
-                {
-                    destructure_from_ex(sp, e.leading[i], ::MIR::LValue::new_Field(lval.clone(), i), cb, allow_refutable);
-                }
-                // TODO: Is there a binding in the middle?
-                unsigned int ofs = e.total_size - e.trailing.size();
-                for(unsigned int i = 0; i < e.trailing.size(); i ++ )
-                {
-                    destructure_from_ex(sp, e.trailing[i], ::MIR::LValue::new_Field(lval.clone(), ofs+i), cb, allow_refutable);
-                }
-                }
-            TU_ARMA(PathValue, e) {
-                // Nothing.
-                if( e.binding.is_Enum() && e.binding.as_Enum().ptr->num_variants() > 1 ) {
-                    ASSERT_BUG(sp, allow_refutable != AllowRefutable::No, "Refutable pattern not expected - " << pat);
-                }
-                }
-            TU_ARMA(PathTuple, e) {
-                if(const auto* be = e.binding.opt_Enum())
-                {
-                    const auto& enm = *be->ptr;
-                    const auto& variants = enm.m_data.as_Data();
-                    // Check that this is the only non-impossible arm
-                    if( allow_refutable == AllowRefutable::No )
-                    {
-                        for(size_t i = 0; i < variants.size(); i ++)
-                        {
-                            const auto& var_ty = variants[i].type;
-                            // Skip this arm
-                            if( i == be->var_idx ) {
-                                continue;
-                            }
-                            ::HIR::TypeRef  tmp;
-                            const auto& ty = monomorphise_type_with_opt(sp, tmp, var_ty, MonomorphStatePtr(nullptr, &e.path.m_data.as_Generic().m_params, nullptr));
-                            if( m_builder.resolve().type_is_impossible(sp, ty) ) {
-                                continue;
-                            }
-                            ERROR(sp, E0000, "Variant " << variants[i].name << " not handled");
-                        }
-                    }
-                    lval = ::MIR::LValue::new_Downcast(mv$(lval), be->var_idx);
-                }
-                for(unsigned int i = 0; i < e.leading.size(); i ++ )
-                {
-                    destructure_from_ex(sp, e.leading[i], ::MIR::LValue::new_Field(lval.clone(), i), cb, allow_refutable);
-                }
-                for(unsigned int i = 0; i < e.trailing.size(); i ++ )
-                {
-                    destructure_from_ex(sp, e.trailing[i], ::MIR::LValue::new_Field(lval.clone(), e.total_size - e.trailing.size() + i), cb, allow_refutable);
-                }
-                }
-            TU_ARMA(PathNamed, e) {
-                if(const auto* be = e.binding.opt_Enum())
-                {
-                    const auto& enm = *be->ptr;
-                    if(enm.m_data.is_Data())
-                    {
-                        const auto& variants = enm.m_data.as_Data();
-                        // Check that this is the only non-impossible arm
-                        if( allow_refutable == AllowRefutable::No )
-                        {
-                            for(size_t i = 0; i < variants.size(); i ++)
-                            {
-                                const auto& var_ty = variants[i].type;
-                                // Skip this arm
-                                if( i == be->var_idx ) {
-                                    continue;
-                                }
-                                ::HIR::TypeRef  tmp;
-                                const auto& ty = monomorphise_type_with_opt(sp, tmp, var_ty, MonomorphStatePtr(nullptr, &e.path.m_data.as_Generic().m_params, nullptr));
-                                if( m_builder.resolve().type_is_impossible(sp, ty) ) {
-                                    continue;
-                                }
-                                ERROR(sp, E0000, "Variant " << variants[i].name << " not handled");
-                            }
-                        }
-                    }
-                    lval = ::MIR::LValue::new_Downcast(mv$(lval), be->var_idx);
-                }
-                if( !e.sub_patterns.empty() )
-                {
-                    const auto& fields = ::HIR::pattern_get_named(sp, e.path, e.binding);
-                    for(const auto& fld_pat : e.sub_patterns)
-                    {
-                        unsigned idx = ::std::find_if( fields.begin(), fields.end(), [&](const auto&x){ return x.first == fld_pat.first; } ) - fields.begin();
-                        destructure_from_ex(sp, fld_pat.second, ::MIR::LValue::new_Field(lval.clone(), idx), cb, allow_refutable);
-                    }
-                }
-                }
-            // Refutable
-            TU_ARMA(Value, e) {
-                ASSERT_BUG(sp, allow_refutable != AllowRefutable::No, "Refutable pattern not expected - " << pat);
-                }
-            TU_ARMA(Range, e) {
-                ASSERT_BUG(sp, allow_refutable != AllowRefutable::No, "Refutable pattern not expected - " << pat);
-                }
-            TU_ARMA(Slice, e) {
-                // These are only refutable if T is [T]
-                bool ty_is_array = false;
-                m_builder.with_val_type(sp, lval, [&ty_is_array](const auto& ty){
-                    ty_is_array = ty.data().is_Array();
-                    });
-                if( ty_is_array )
-                {
-                    // TODO: Assert array size
-                    for(unsigned int i = 0; i < e.sub_patterns.size(); i ++)
-                    {
-                        const auto& subpat = e.sub_patterns[i];
-                        destructure_from_ex(sp, subpat, ::MIR::LValue::new_Field(lval.clone(), i), cb, allow_refutable );
-                    }
-                }
-                else
-                {
-                    ASSERT_BUG(sp, allow_refutable != AllowRefutable::No, "Refutable pattern not expected - " << pat);
+            return lval;
+        }
 
-                    // TODO: Emit code to triple-check the size? Or just assume that match did that correctly.
-                    for(unsigned int i = 0; i < e.sub_patterns.size(); i ++)
-                    {
-                        const auto& subpat = e.sub_patterns[i];
-                        destructure_from_ex(sp, subpat, ::MIR::LValue::new_Field(lval.clone(), i), cb, allow_refutable );
-                    }
-                }
-                }
-            TU_ARMA(SplitSlice, e) {
-                // These are only refutable if T is [T]
-                bool ty_is_array = false;
-                unsigned int array_size = 0;
-                ::HIR::TypeRef  inner_type;
-                m_builder.with_val_type(sp, lval, [&ty_is_array,&array_size,&e,&inner_type](const auto& ty){
-                    if( ty.data().is_Array() ) {
-                        array_size = ty.data().as_Array().size.as_Known();
-                        if( e.extra_bind.is_valid() )
-                            inner_type = ty.data().as_Array().inner.clone();
-                        ty_is_array = true;
-                    }
-                    else {
-                        if( e.extra_bind.is_valid() )
-                            inner_type = ty.data().as_Slice().inner.clone();
-                        ty_is_array = false;
-                    }
-                    });
-                if( ty_is_array )
-                {
-                    assert(array_size >= e.leading.size() + e.trailing.size());
-                    for(unsigned int i = 0; i < e.leading.size(); i ++)
-                    {
-                        unsigned int idx = 0 + i;
-                        destructure_from_ex(sp, e.leading[i], ::MIR::LValue::new_Field(lval.clone(), idx), cb, allow_refutable );
-                    }
-                    if( e.extra_bind.is_valid() )
-                    {
-                        TODO(sp, "Destructure array obtaining remainder");
-                    }
-                    for(unsigned int i = 0; i < e.trailing.size(); i ++)
-                    {
-                        unsigned int idx = array_size - e.trailing.size() + i;
-                        destructure_from_ex(sp, e.trailing[i], ::MIR::LValue::new_Field(lval.clone(), idx), cb, allow_refutable );
-                    }
-                }
-                else
-                {
-                    ASSERT_BUG(sp, allow_refutable != AllowRefutable::No, "Refutable pattern not expected - " << pat);
+        void destructure_from_list(const Span& sp, const ::HIR::TypeRef& outer_ty, ::MIR::LValue outer_lval, const ::std::vector<PatternBinding>& bindings) override
+        {
+            TRACE_FUNCTION_F(outer_lval << ": " << outer_ty << " [" << bindings << "]");
+            // Reverse order to avoid potential use-after-move for `foo @ Bar(baz, ..)`
+            for(size_t i = bindings.size(); i--;)
+            {
+                const auto& b = bindings[i];
+                auto lval = get_value_for_binding_path(sp, outer_ty, outer_lval, b);
 
-                    struct H {
-                        static ::HIR::BorrowType get_borrow_type(const Span& sp, const ::HIR::PatternBinding& pb) {
-                            switch(pb.m_type)
-                            {
-                            case ::HIR::PatternBinding::Type::Move:
-                                BUG(sp, "By-value pattern binding of a slice");
-                            case ::HIR::PatternBinding::Type::Ref:
-                                return ::HIR::BorrowType::Shared;
-                            case ::HIR::PatternBinding::Type::MutRef:
-                                return ::HIR::BorrowType::Unique;
-                            }
-                            throw "";
-                        }
-                    };
-
-                    // Acquire the slice size variable.
-                    ::MIR::LValue   len_lval;
-                    if( e.extra_bind.is_valid() || e.trailing.size() > 0 )
+                MIR::RValue rv;
+                switch( b.binding->m_type )
+                {
+                case ::HIR::PatternBinding::Type::Move:
+                    rv = mv$(lval);
+                    break;
+                case ::HIR::PatternBinding::Type::Ref:
+                    if(m_borrow_raise_target)
                     {
-                        len_lval = m_builder.lvalue_or_temp(sp, ::HIR::CoreType::Usize, ::MIR::RValue::make_DstMeta({ m_builder.get_ptr_to_dst(sp, lval) }));
+                        DEBUG("- Raising destructure borrow of " << lval << " to scope " << *m_borrow_raise_target);
+                        m_builder.raise_temporaries(sp, lval, *m_borrow_raise_target);
                     }
 
-                    for(unsigned int i = 0; i < e.leading.size(); i ++)
+                    rv = ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Shared, mv$(lval) });
+                    break;
+                case ::HIR::PatternBinding::Type::MutRef:
+                    if(m_borrow_raise_target)
                     {
-                        unsigned int idx = i;
-                        destructure_from_ex(sp, e.leading[i], ::MIR::LValue::new_Field(lval.clone(), idx), cb, allow_refutable );
+                        DEBUG("- Raising destructure borrow of " << lval << " to scope " << *m_borrow_raise_target);
+                        m_builder.raise_temporaries(sp, lval, *m_borrow_raise_target);
                     }
-                    if( e.extra_bind.is_valid() )
-                    {
-                        // 1. Obtain remaining length
-                        auto sub_val = ::MIR::Param(::MIR::Constant::make_Uint({ e.leading.size() + e.trailing.size(), ::HIR::CoreType::Usize }));
-                        ::MIR::LValue len_val = m_builder.lvalue_or_temp(sp, ::HIR::CoreType::Usize, ::MIR::RValue::make_BinOp({ len_lval.clone(), ::MIR::eBinOp::SUB, mv$(sub_val) }) );
-
-                        // 2. Obtain pointer to element
-                        ::HIR::BorrowType   bt = H::get_borrow_type(sp, e.extra_bind);
-                        ::MIR::LValue ptr_val = m_builder.lvalue_or_temp(sp,
-                            ::HIR::TypeRef::new_borrow( bt, inner_type.clone() ),
-                            ::MIR::RValue::make_Borrow({ bt, ::MIR::LValue::new_Field( lval.clone(), static_cast<unsigned int>(e.leading.size()) ) })
-                            );
-                        // TODO: Cast to raw pointer? Or keep as a borrow?
-
-                        // Construct fat pointer
-                        m_builder.push_stmt_assign( sp, m_builder.get_variable(sp, e.extra_bind.m_slot), ::MIR::RValue::make_MakeDst({ mv$(ptr_val), mv$(len_val) }) );
-                    }
-                    if( e.trailing.size() > 0 )
-                    {
-                        for(size_t i = 0; i < e.trailing.size(); i ++)
-                        {
-                            // Dynamically create an index
-                            auto sub_val = ::MIR::Param(::MIR::Constant::make_Uint({ e.trailing.size() - i, ::HIR::CoreType::Usize }));
-                            ::MIR::LValue ofs_val = m_builder.lvalue_or_temp(sp, ::HIR::CoreType::Usize, ::MIR::RValue::make_BinOp({ len_lval.clone(), ::MIR::eBinOp::SUB, mv$(sub_val) }) );
-                            // Recurse with the indexed value
-                            destructure_from_ex(sp, e.trailing[i], ::MIR::LValue::new_Index( lval.clone(), ofs_val.m_root.as_Local() ), cb, allow_refutable);
-                        }
-                    }
+                    rv = ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Unique, mv$(lval) });
+                    break;
                 }
-                }
-            } // TU_MATCH_HDRA
+                m_builder.push_stmt_assign( sp, m_builder.get_variable(sp, b.binding->m_slot), mv$(rv) );
+            }
+        }
+        void destructure_aliases_from_list(const Span& sp, const ::HIR::TypeRef& outer_ty, ::MIR::LValue outer_lval, const ::std::vector<PatternBinding>& bindings) override
+        {
+            for(const auto& b : bindings)
+            {
+                auto val = get_value_for_binding_path(sp, outer_ty, outer_lval, b);
+                m_builder.add_variable_alias(sp, b.binding->m_slot, b.binding->m_type, mv$(val));
+            }
         }
 
         // -- ExprVisitor
@@ -717,6 +507,97 @@ namespace {
             m_builder.push_stmt_asm( node.span(), { node.m_template, mv$(outputs), mv$(inputs), node.m_clobbers, node.m_flags } );
             m_builder.set_result(node.span(), ::MIR::RValue::make_Tuple({}));
         }
+        void visit(::HIR::ExprNode_Asm2& node) override
+        {
+            TRACE_FUNCTION_F("_Asm2");
+
+            // TODO: How to represent inout in the MIR?
+            // - Potentially a register specifier that links to one of the inputs
+            // - OR: Just keep the parameter list as before - but now simplified to just one `Reg`
+            ::MIR::Statement::Data_Asm2 ent;
+            ent.options = node.m_options;
+            ent.lines = node.m_lines;
+
+            for(auto& v : node.m_params)
+            {
+                TU_MATCH_HDRA( (v), { )
+                TU_ARMA(Const, e) {
+                    // TODO: This constant needs to have been evaluated fully (so a `MIR::Constant` can be created)
+                    //ent.params.push_back(MIR::AsmParam::make_Const());
+                    TODO(node.span(), "asm! const");
+                    }
+                TU_ARMA(Sym, e) {
+                    ent.params.push_back(MIR::AsmParam::make_Sym(e.clone()));
+                    }
+                TU_ARMA(RegSingle, e) {
+                    std::unique_ptr<MIR::Param> input;
+                    std::unique_ptr<MIR::LValue> output;
+                    this->visit_node_ptr(e.val);
+                    switch(e.dir)
+                    {
+                    case AsmCommon::Direction::In:
+                        ASSERT_BUG(node.span(), e.val, "`in` register with no value");
+                        input = box$( m_builder.get_result_in_param(e.val->span(), e.val->m_res_type) );
+                        break;
+                    case AsmCommon::Direction::Out:
+                    case AsmCommon::Direction::LateOut:
+                        if(e.val)
+                        {
+                            output = box$( m_builder.get_result_unwrap_lvalue(e.val->span()) );
+                        }
+                        break;
+                    case AsmCommon::Direction::InOut:
+                    case AsmCommon::Direction::InLateOut:
+                        ASSERT_BUG(node.span(), e.val, "`inout` register with no value");
+                        output = box$( m_builder.get_result_unwrap_lvalue(e.val->span()) );
+                        input = std::make_unique<MIR::Param>( output->clone() );
+                        break;
+                    }
+                    ent.params.push_back(MIR::AsmParam::make_Reg({
+                        e.dir, std::move(e.spec), std::move(input), std::move(output)
+                        }));
+                    }
+                TU_ARMA(Reg, e) {
+                    std::unique_ptr<MIR::Param> input;
+                    std::unique_ptr<MIR::LValue> output;
+                    switch(e.dir)
+                    {
+                    case AsmCommon::Direction::In:
+                        ASSERT_BUG(node.span(), e.val_in, "`in` register with no input");
+                        this->visit_node_ptr(e.val_in);
+                        input = box$( m_builder.get_result_in_param(e.val_in->span(), e.val_in->m_res_type) );
+                        assert(!e.val_out);
+                        break;
+                    case AsmCommon::Direction::Out:
+                    case AsmCommon::Direction::LateOut:
+                        ASSERT_BUG(node.span(), !e.val_in, "`[late]out` register with input value");
+                        if(e.val_out)
+                        {
+                            this->visit_node_ptr(e.val_out);
+                            output = box$( m_builder.get_result_unwrap_lvalue(e.val_out->span()) );
+                        }
+                        break;
+                    case AsmCommon::Direction::InOut:
+                    case AsmCommon::Direction::InLateOut:
+                        ASSERT_BUG(node.span(), e.val_in, "`in[late]out` register with no input");
+                        this->visit_node_ptr(e.val_in);
+                        input = box$( m_builder.get_result_in_param(e.val_in->span(), e.val_in->m_res_type) );
+                        if( e.val_out )
+                        {
+                            this->visit_node_ptr(e.val_out);
+                            output = box$( m_builder.get_result_unwrap_lvalue(e.val_out->span()) );
+                        }
+                        break;
+                    }
+                    ent.params.push_back(MIR::AsmParam::make_Reg({
+                        e.dir, std::move(e.spec), std::move(input), std::move(output)
+                        }));
+                    }
+                }
+            }
+            m_builder.push_stmt( node.span(), mv$(ent) );
+            m_builder.set_result(node.span(), ::MIR::RValue::make_Tuple({}));
+        }
         void visit(::HIR::ExprNode_Return& node) override
         {
             TRACE_FUNCTION_F("_Return");
@@ -802,13 +683,20 @@ namespace {
                 }
                 auto res = m_builder.get_result(node.span());
 
-                if( node.m_pattern.m_binding.is_valid() && node.m_pattern.m_data.is_Any() && node.m_pattern.m_binding.m_type == ::HIR::PatternBinding::Type::Move )
+                // Shortcut for `let foo = bar;` (avoids the extra temporary that would need to be optimised out)
+                if( node.m_pattern.m_data.is_Any() && std::all_of(node.m_pattern.m_bindings.begin(), node.m_pattern.m_bindings.end(), [](const HIR::PatternBinding& pb){ return pb.m_type == ::HIR::PatternBinding::Type::Move;}) )
                 {
-                    m_builder.push_stmt_assign( node.span(), m_builder.get_variable(node.span(), node.m_pattern.m_binding.m_slot),  mv$(res) );
+                    for(const auto& pb : node.m_pattern.m_bindings) {
+                        m_builder.push_stmt_assign( node.span(), m_builder.get_variable(node.span(), pb.m_slot),  mv$(res) );
+                    }
                 }
                 else
                 {
-                    this->destructure_from(node.span(), node.m_pattern, m_builder.lvalue_or_temp(node.m_value->span(), node.m_type, mv$(res)));
+                    MIR_LowerHIR_Let(
+                        m_builder, *this, node.span(),
+                        node.m_pattern, m_builder.lvalue_or_temp(node.m_value->span(), node.m_type, mv$(res)),
+                        nullptr
+                        );
                 }
             }
             m_builder.set_result(node.span(), ::MIR::RValue::make_Tuple({}));
@@ -948,33 +836,6 @@ namespace {
                 // Push an "diverge" result
                 //m_builder.set_cur_block( m_builder.new_bb_unlinked() );
                 //m_builder.set_result(node.span(), ::MIR::LValue::make_Invalid({}) );
-            }
-            else if( node.m_arms.size() == 1 && node.m_arms[0].m_patterns.size() == 1 && ! node.m_arms[0].m_cond ) {
-                // - Shortcut: Single-arm match
-                auto& arm = node.m_arms[0];
-                const auto& pat = arm.m_patterns[0];
-
-                auto scope = m_builder.new_scope_var(arm.m_code->span());
-                auto tmp_scope = m_builder.new_scope_temp(arm.m_code->span());
-                this->define_vars_from(node.span(), pat);
-                // TODO: Do the same shortcut as _Let?
-                this->destructure_from(node.span(), pat, mv$(match_val));
-
-                // Temp scope.
-                this->visit_node_ptr(arm.m_code);
-
-                if( m_builder.block_active() ) {
-                    auto res = m_builder.get_result(arm.m_code->span());
-                    m_builder.raise_temporaries( arm.m_code->span(), res, scope, /*to_above=*/true);
-                    m_builder.set_result(arm.m_code->span(), mv$(res));
-
-                    m_builder.terminate_scope( node.span(), mv$(tmp_scope) );
-                    m_builder.terminate_scope( node.span(), mv$(scope) );
-                }
-                else {
-                    m_builder.terminate_scope( node.span(), mv$(tmp_scope), false );
-                    m_builder.terminate_scope( node.span(), mv$(scope), false );
-                }
             }
             else {
                 MIR_LowerHIR_Match(m_builder, *this, node, mv$(match_val));
@@ -1479,6 +1340,31 @@ namespace {
 
             m_builder.set_result( node.span(), ::MIR::RValue::make_Borrow({ node.m_type, mv$(val) }) );
         }
+        void visit(::HIR::ExprNode_RawBorrow& node) override
+        {
+            TRACE_FUNCTION_F("_RawBorrow");
+
+            auto _ = save_and_edit(m_in_borrow, true);
+
+            const auto& ty_val = node.m_value->m_res_type;
+            this->visit_node_ptr(node.m_value);
+            auto val = m_builder.get_result_in_lvalue(node.m_value->span(), ty_val);
+
+            if( m_borrow_raise_target )
+            {
+                DEBUG("- Raising borrow to scope " << *m_borrow_raise_target);
+                m_builder.raise_temporaries(node.span(), val, *m_borrow_raise_target);
+            }
+
+            // TODO: MIR op too?
+            m_builder.set_result( node.span(), ::MIR::RValue::make_Borrow({ node.m_type, mv$(val) }) );
+
+            // HACK: Insert a cast
+            {
+                auto val = m_builder.get_result_in_lvalue(node.span(), ::HIR::TypeRef::new_borrow(node.m_type, ty_val.clone()));
+                m_builder.set_result( node.span(), ::MIR::RValue::make_Cast({ mv$(val), node.m_res_type.clone() }));
+            }
+        }
         void visit(::HIR::ExprNode_Cast& node) override
         {
             TRACE_FUNCTION_F("_Cast " << node.m_res_type);
@@ -1526,7 +1412,7 @@ namespace {
                     }
                     // Valid
                 }
-                else if( const auto* se = ty_in.data().opt_Function() )
+                else if( /*const auto* se =*/ ty_in.data().opt_Function() )
                 {
                     if( de.inner != ::HIR::TypeRef::new_unit() && de.inner != ::HIR::CoreType::U8 && de.inner != ::HIR::CoreType::I8 ) {
                         BUG(node.span(), "Cannot cast to " << ty_out << " from " << ty_in);
@@ -1644,12 +1530,12 @@ namespace {
                     if( m_builder.resolve().find_impl( node.span(), lang_Unsize, ::HIR::PathParams(ty_out.clone()), ty_in.clone(), [](auto , bool ){ return true; }) )
                     {
                         // - HACK: Emit a cast operation on the pointers. Leave it up to monomorph to 'fix' it
-                        m_builder.set_result( node.span(), ::MIR::RValue::make_Cast({ mv$(ptr_lval), node.m_res_type.clone() }) );
+                        m_builder.set_result( node.span(), ::MIR::RValue::make_MakeDst({ mv$(ptr_lval), ::MIR::Constant::make_ItemAddr({}) }) );
                     }
                     else
                     {
                         // Probably an error?
-                        m_builder.set_result( node.span(), ::MIR::RValue::make_Cast({ mv$(ptr_lval), node.m_res_type.clone() }) );
+                        m_builder.set_result( node.span(), ::MIR::RValue::make_MakeDst({ mv$(ptr_lval), ::MIR::Constant::make_ItemAddr({}) }) );
                         //TODO(node.span(), "MIR _Unsize to " << ty_out);
                     }
                     }
@@ -1659,10 +1545,13 @@ namespace {
                         const auto& in_array = ty_in.data().as_Array();
                         ::MIR::Constant size_val;
                         TU_MATCH_HDRA( (in_array.size), {)
-                        default:
-                            BUG(node.span(), "Unsize Array with unknown size " << ty_in);
-                        TU_ARMA(Generic, se) {
-                            size_val = se;
+                        TU_ARMA(Unevaluated, se) {
+                            TU_MATCH_HDRA( (se), {)
+                            default:
+                                BUG(node.span(), "Unsize Array with unknown size " << ty_in);
+                            TU_ARMA(Generic, cge)
+                                size_val = cge;
+                            }
                             }
                         TU_ARMA(Known, se) {
                             size_val = ::MIR::Constant::make_Uint({ se, ::HIR::CoreType::Usize });
@@ -1683,7 +1572,7 @@ namespace {
                     }
                     }
                 TU_ARMA(TraitObject, e) {
-                    m_builder.set_result( node.span(), ::MIR::RValue::make_Cast({ mv$(ptr_lval), node.m_res_type.clone() }) );
+                    m_builder.set_result( node.span(), ::MIR::RValue::make_MakeDst({ mv$(ptr_lval), ::MIR::Constant::make_ItemAddr({}) }) );
                     }
                 }
             }
@@ -1695,7 +1584,7 @@ namespace {
 
                 // TODO: Just emit a cast and leave magic handling to codegen
                 // - This code _could_ do inspection of the types and insert a destructure+unsize+restructure, but that does't handle direct `T: CoerceUnsize<U>`
-                m_builder.set_result( node.span(), ::MIR::RValue::make_Cast({ mv$(ptr_lval), node.m_res_type.clone() }) );
+                m_builder.set_result( node.span(), ::MIR::RValue::make_MakeDst({ mv$(ptr_lval), ::MIR::Constant::make_ItemAddr({}) }) );
             }
         }
         void visit(::HIR::ExprNode_Index& node) override
@@ -1717,8 +1606,13 @@ namespace {
                 BUG(node.span(), "Indexing unsupported type " << ty_val);
             TU_ARMA(Array, e) {
                 TU_MATCH_HDRA( (e.size), {)
-                default:
-                    BUG(node.span(), "Indexing with unknown size" << ty_val);
+                TU_ARMA(Unevaluated, se) {
+                    if(se.is_Generic() ) {
+                        limit_val = ::MIR::Constant::make_Generic(se.as_Generic());
+                        break;
+                    }
+                    BUG(node.span(), "Indexing with unknown size - " << e.size);
+                    }
                 TU_ARMA(Known, se) {
                     limit_val = ::MIR::Constant::make_Uint({ se, ::HIR::CoreType::Usize });
                     }
@@ -1847,15 +1741,9 @@ namespace {
 
         void visit(::HIR::ExprNode_Emplace& node) override
         {
-            switch(gTargetVersion)
-            {
-            case TargetVersion::Rustc1_19:
+            if(TARGETVER_MOST_1_19)
                 return visit_emplace_119(node);
-            case TargetVersion::Rustc1_29:
-            case TargetVersion::Rustc1_39:
-                return visit_emplace_129(node);
-            }
-            throw "BUG: Unhandled target version";
+            return visit_emplace_129(node);
         }
         void visit_emplace_119(::HIR::ExprNode_Emplace& node)
         {
@@ -2060,7 +1948,7 @@ namespace {
             // 3. Do a non-dropping write into the target location (i.e. just a MIR assignment)
             m_builder.push_stmt_assign(node.span(), ::MIR::LValue::new_Deref(place.clone()), mv$(val), /*drop_destination=*/false);
             // 4. Convert the pointer into an `owned_box`
-            auto res_type = ::HIR::TypeRef::new_path(::HIR::GenericPath(lang_owned_box, mv$(trait_params_data)), &m_builder.crate().get_struct_by_path(node.span(), lang_owned_box));
+            const auto& res_type = node.m_res_type;
             auto res = m_builder.new_temporary(res_type);
             auto cast__panic = m_builder.new_bb_unlinked();
             auto cast__ok = m_builder.new_bb_unlinked();
@@ -2702,13 +2590,7 @@ namespace {
         void visit(::HIR::ExprNode_Tuple& node) override
         {
             TRACE_FUNCTION_F("_Tuple");
-            ::std::vector< ::MIR::Param>   values;
-            values.reserve( node.m_vals.size() );
-            for(auto& arg : node.m_vals)
-            {
-                this->visit_node_ptr(arg);
-                values.push_back( m_builder.get_result_in_param(arg->span(), arg->m_res_type) );
-            }
+            auto values = get_args(node.m_vals);
 
             m_builder.set_result( node.span(), ::MIR::RValue::make_Tuple({
                 mv$(values)
@@ -2718,13 +2600,7 @@ namespace {
         void visit(::HIR::ExprNode_ArrayList& node) override
         {
             TRACE_FUNCTION_F("_ArrayList");
-            ::std::vector< ::MIR::Param>   values;
-            values.reserve( node.m_vals.size() );
-            for(auto& arg : node.m_vals)
-            {
-                this->visit_node_ptr(arg);
-                values.push_back( m_builder.get_result_in_param(arg->span(), arg->m_res_type) );
-            }
+            auto values = get_args(node.m_vals);
 
             m_builder.set_result( node.span(), ::MIR::RValue::make_Array({
                 mv$(values)
@@ -2739,7 +2615,7 @@ namespace {
 
             m_builder.set_result( node.span(), ::MIR::RValue::make_SizedArray({
                 mv$(value),
-                static_cast<unsigned int>(node.m_size_val)
+                std::move(node.m_size)
                 }) );
         }
 
@@ -2832,15 +2708,16 @@ namespace {
         for( const auto& arg : args )
         {
             const auto& pat = arg.first;
-            // What's the idea of this check? How could it _not_ be true in most cases (and thus not prepare the input)
-            if( pat.m_binding.is_valid() && pat.m_binding.m_type == ::HIR::PatternBinding::Type::Move )
+            // If the binding is set (i.e. this isn't destructuring) then the table populated by `MirBuilder::MirBuilder(...)` will be used
+            if( pat.m_bindings.size() == 1 && pat.m_bindings[0].m_type == ::HIR::PatternBinding::Type::Move )
             {
                 // Simple `var: Type` arguments are handled by `MirBuilder.m_var_arg_mappings`
             }
             else
             {
+                DEBUG("Argument a" << i << " - " << pat);
                 ev.define_vars_from(ptr->span(), arg.first);
-                ev.destructure_from(ptr->span(), arg.first, ::MIR::LValue::new_Argument(i));
+                MIR_LowerHIR_Let(builder, ev, ptr->span(), arg.first, ::MIR::LValue::new_Argument(i), /*else_node=*/nullptr);
             }
             i ++;
         }
@@ -3030,9 +2907,9 @@ void HIR_GenerateMIR_Expr(const ::HIR::Crate& crate, const ::HIR::ItemPath& path
 {
     if( !expr_ptr.m_mir )
     {
+        TRACE_FUNCTION;
         StaticTraitResolve  resolve { crate };
-        if(expr_ptr.m_state->m_impl_generics)   resolve.set_impl_generics(*expr_ptr.m_state->m_impl_generics);
-        if(expr_ptr.m_state->m_item_generics)   resolve.set_item_generics(*expr_ptr.m_state->m_item_generics);
+        resolve.set_both_generics_raw(expr_ptr.m_state->m_impl_generics, expr_ptr.m_state->m_item_generics);
         expr_ptr.set_mir( LowerMIR(resolve, path, expr_ptr, res_ty, args) );
         // Run cleanup to simplify consteval?
         // - This ends up running before things like vtable generation
